@@ -43,6 +43,15 @@ class SimulationParameters : public SimulationParametersBase
                 puncture_tracking_writeout_level, 0);
         pp.load("calculate_constraint_norms", calculate_constraint_norms,
                 false);
+        // Cell selection for the constraint norms (see ConstraintNorms.hpp):
+        // exclude a ball of this radius around each puncture (psi diverges
+        // there, so |H| is a large cancellation) and drop this many cells from
+        // the level-0 domain edge (the fourth-order stencil reaches into
+        // ghost cells filled from the outer boundary condition).
+        pp.load("constraint_norm_exclusion_radius",
+                constraint_norm_exclusion_radius, 0.0);
+        pp.load("constraint_norm_border_cells", constraint_norm_border_cells,
+                0);
     }
 
 #ifdef USE_TWOPUNCTURES
@@ -318,6 +327,8 @@ class SimulationParameters : public SimulationParametersBase
     int puncture_tracking_level{};
     int puncture_tracking_writeout_level{};
     bool calculate_constraint_norms{};
+    double constraint_norm_exclusion_radius{};
+    int constraint_norm_border_cells{};
 
     // Collection of parameters necessary for initial conditions
     // Set these even in the case of TwoPunctures as they are used elsewhere

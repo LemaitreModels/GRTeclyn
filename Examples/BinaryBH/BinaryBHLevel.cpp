@@ -7,6 +7,7 @@
 #include "BinaryBHInitialData.hpp"
 #include "CCZ4RHS.hpp"
 #include "ChiTagger.hpp"
+#include "ConstraintNorms.hpp"
 #include "Constraints.hpp"
 #include "ExtractionTagger.hpp"
 #include "PositiveChiAndLapse.hpp"
@@ -260,6 +261,41 @@ void BinaryBHLevel::specific_post_init()
     if (simParams().puncture_tracking_enabled)
     {
         get_puncture_tracker().start_from_initial_punctures();
+    }
+
+    // Constraint norms of the INITIAL DATA (t = 0).  post_init cascades from
+    // the finest level down, so at Level() == 0 the whole hierarchy exists and
+    // the hierarchy-wide `derive` below is safe.  Measuring here rather than in
+    // specificPostTimeStep means the run needs no evolution step at all.
+    // (The norm block in specificPostTimeStep is still #if 0'd: it uses
+    // GRChombo's AMRReductions, which was never ported to AMReX.)
+    if (simParams().calculate_constraint_norms && Level() == 0)
+    {
+        ConstraintNorms::Options opts;
+        opts.r_excl       = simParams().constraint_norm_exclusion_radius;
+        opts.border_cells = simParams().constraint_norm_border_cells;
+        opts.punctures.push_back(simParams().bh1_params.center);
+        opts.punctures.push_back(simParams().bh2_params.center);
+
+        const amrex::Real time = get_state_data(state_index).curTime();
+        auto res = ConstraintNorms::compute(*get_gramr_ptr(), time, opts);
+
+        amrex::Print() << "Constraint norms at t = " << time
+                       << " (volume-normalised rms over leaf cells, "
+                       << res.n_cells << " cells)\n"
+                       << "  L2_Ham   = " << res.rms_Ham << "\n"
+                       << "  L2_Mom   = " << res.rms_Mom << "\n"
+                       << "  Linf_Ham = " << res.max_Ham << "\n"
+                       << "  Linf_Mom = " << res.max_Mom << "\n";
+
+        std::ostringstream extra;
+        extra << std::setprecision(17);
+        extra << "\"n_cell_level0\": "
+              << get_gramr_ptr()->getLevel(0).Domain().length(0) << ",";
+        ConstraintNorms::write_json(res,
+                                    simParams().data_path +
+                                        "constraint_norms.json",
+                                    time, opts, extra.str());
     }
 }
 
