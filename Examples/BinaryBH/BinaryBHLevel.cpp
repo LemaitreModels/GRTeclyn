@@ -10,6 +10,8 @@
 #include "ConstraintNorms.hpp"
 #include "Constraints.hpp"
 #include "ExtractionTagger.hpp"
+#include "LMInitialData.hpp"
+#include "LMSpectralData.hpp"
 #include "PositiveChiAndLapse.hpp"
 #include "PunctureTagger.hpp"
 #include "PunctureTracker.hpp"
@@ -78,30 +80,85 @@ void BinaryBHLevel::initData()
     BoxLoops::loop(two_punctures_initial_data, m_state_new, m_state_new,
                    INCLUDE_GHOST_CELLS, disable_simd());
 #else
-    // Set up the compute class for the BinaryBH initial data
     double dx = Geom().CellSize(0);
-    BinaryBHInitialData binary_initial_data(simParams().bh1_params,
-                                            simParams().bh2_params, dx);
-
-    static_assert(std::is_trivially_copyable_v<BinaryBHInitialData>,
-                  "BinaryBHInitialData needs to be device copyable");
-
     // First set everything to zero (to avoid undefinded values in constraints)
     // then calculate initial data
     amrex::MultiFab &state_new = get_new_data(state_index);
     const auto &state_arrays   = state_new.arrays();
-    amrex::ParallelFor(state_new, state_new.nGrowVect(),
-                       [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
-                       {
-                           amrex::CellData<amrex::Real> cell =
-                               state_arrays[box_no].cellData(ix, iy, iz);
-                           for (int n = 0; n < cell.nComp(); ++n)
-                           {
-                               cell[n] = 0.;
-                           }
-                           binary_initial_data(ix, iy, iz,
-                                               state_arrays[box_no]);
-                       });
+
+    if (!simParams().lm_id_file.empty())
+    {
+        // LM-initial-data spectral initial data.  Runtime-selected, so this is
+        // the SAME executable, stencils and variable conversion as the analytic
+        // branch below — the comparison is then of initial data alone.
+        // Read once per process (the file is read-only static data used by
+        // every level).
+        static const LMSpectralData lm_data(simParams().lm_id_file);
+        LMInitialData::params_t lm_params =
+            lm_data.params(simParams().center, Lapse::PRE_COLLAPSED);
+        LMInitialData lm_initial_data(lm_params, dx);
+
+        static_assert(std::is_trivially_copyable_v<LMInitialData>,
+                      "LMInitialData needs to be device copyable");
+
+        // psi_BL diverges at the punctures: refuse a grid that samples one.
+        LMInitialData::validate_staggering(lm_params, dx);
+
+        if (Level() == 0)
+        {
+            for (const auto &line : lm_data.provenance())
+            {
+                amrex::Print() << "LM-ID:" << line << "\n";
+            }
+            if (!simParams().lm_id_reference_file.empty())
+            {
+                auto err =
+                    lm_initial_data.validate(simParams().lm_id_reference_file);
+                if (err[0] > simParams().lm_id_reference_tol ||
+                    err[1] > simParams().lm_id_reference_tol)
+                {
+                    amrex::Abort(
+                        "LMInitialData: the C++ evaluation disagrees with the "
+                        "exported reference table beyond lm_id_reference_tol");
+                }
+            }
+        }
+
+        amrex::ParallelFor(
+            state_new, state_new.nGrowVect(),
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                amrex::CellData<amrex::Real> cell =
+                    state_arrays[box_no].cellData(ix, iy, iz);
+                for (int n = 0; n < cell.nComp(); ++n)
+                {
+                    cell[n] = 0.;
+                }
+                lm_initial_data(ix, iy, iz, state_arrays[box_no]);
+            });
+    }
+    else
+    {
+        // Set up the compute class for the BinaryBH initial data
+        BinaryBHInitialData binary_initial_data(simParams().bh1_params,
+                                                simParams().bh2_params, dx);
+
+        static_assert(std::is_trivially_copyable_v<BinaryBHInitialData>,
+                      "BinaryBHInitialData needs to be device copyable");
+
+        amrex::ParallelFor(
+            state_new, state_new.nGrowVect(),
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                amrex::CellData<amrex::Real> cell =
+                    state_arrays[box_no].cellData(ix, iy, iz);
+                for (int n = 0; n < cell.nComp(); ++n)
+                {
+                    cell[n] = 0.;
+                }
+                binary_initial_data(ix, iy, iz, state_arrays[box_no]);
+            });
+    }
 #endif
     amrex::Gpu::streamSynchronize();
 

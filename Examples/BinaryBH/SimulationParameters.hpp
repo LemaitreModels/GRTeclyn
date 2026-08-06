@@ -52,6 +52,15 @@ class SimulationParameters : public SimulationParametersBase
                 constraint_norm_exclusion_radius, 0.0);
         pp.load("constraint_norm_border_cells", constraint_norm_border_cells,
                 0);
+
+        // LM-initial-data spectral initial data (LMInitialData.hpp).  Runtime
+        // switch, not a build flag: the class is header-only with no external
+        // dependency, so one binary can run both initial-data paths — which is
+        // the point, since the comparison must hold the discretisation and the
+        // variable conversion fixed.  Empty => use the analytic initial data.
+        pp.load("lm_id_file", lm_id_file, std::string(""));
+        pp.load("lm_id_reference_file", lm_id_reference_file, std::string(""));
+        pp.load("lm_id_reference_tol", lm_id_reference_tol, 1.0e-10);
     }
 
 #ifdef USE_TWOPUNCTURES
@@ -329,6 +338,9 @@ class SimulationParameters : public SimulationParametersBase
     bool calculate_constraint_norms{};
     double constraint_norm_exclusion_radius{};
     int constraint_norm_border_cells{};
+    std::string lm_id_file;
+    std::string lm_id_reference_file;
+    double lm_id_reference_tol{};
 
     // Collection of parameters necessary for initial conditions
     // Set these even in the case of TwoPunctures as they are used elsewhere
