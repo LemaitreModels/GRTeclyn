@@ -82,12 +82,23 @@ LMInitialData::u(amrex::Real x, amrex::Real y, amrex::Real z) const
     bary(Bq, m_params.B, m_params.wB, m_params.nB, tB);
 
     // Interpolate the phi-modal coefficients in (A,B) — B inner, A outer, the
-    // same order as the reference evaluator — then sum the trig series.
+    // same order as the reference evaluator — restore the axis factor at the
+    // query point, then sum the trig series.
     // The (A,B) rule is linear, so interpolating the coefficients and then
     // summing the series equals interpolating per phi-plane then in phi.
-    const int nA = m_params.nA;
-    const int nB = m_params.nB;
-    amrex::Real out = 0.0;
+    //
+    // The stored C,S are the SMOOTH factor (format 2): the wavenumber-k part of
+    // u carries w(k,B) = (1-B^2)^(k/2) at the axis, which is not a polynomial in
+    // B — for odd k not even smooth at B=+-1 — so it is divided out before the
+    // solver's polynomial interpolation and multiplied back here.  Applying it
+    // AFTER the (A,B) interpolation is what makes this evaluator the truncated
+    // spectral expansion exactly rather than an approximation to it.
+    // `one_minus_B2 >= 0` because Bq is clamped to [-1,1] above; it is 0 exactly
+    // on the axis, where every k>0 mode correctly contributes nothing.
+    const int nA                  = m_params.nA;
+    const int nB                  = m_params.nB;
+    const amrex::Real one_minus_B2 = 1.0 - Bq * Bq;
+    amrex::Real out               = 0.0;
 
     for (int t = 0; t < m_params.ncos; ++t)
     {
@@ -101,7 +112,10 @@ LMInitialData::u(amrex::Real x, amrex::Real y, amrex::Real z) const
             }
             coef += tA[i] * inner;
         }
-        out += coef * std::cos(m_params.cos_m[t] * phi);
+        const int k = m_params.cos_m[t];
+        const amrex::Real w =
+            (k == 0) ? 1.0 : std::pow(one_minus_B2, 0.5 * k);
+        out += w * coef * std::cos(k * phi);
     }
     for (int t = 0; t < m_params.nsin; ++t)
     {
@@ -115,7 +129,9 @@ LMInitialData::u(amrex::Real x, amrex::Real y, amrex::Real z) const
             }
             coef += tA[i] * inner;
         }
-        out += coef * std::sin(m_params.sin_m[t] * phi);
+        const int k = m_params.sin_m[t];
+        const amrex::Real w = std::pow(one_minus_B2, 0.5 * k); // k >= 1 here
+        out += w * coef * std::sin(k * phi);
     }
     return out;
 }

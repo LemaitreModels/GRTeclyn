@@ -12,7 +12,7 @@
 // `TP::TwoPunctures` / `TwoPuncturesInitialData`.
 //
 // FILE FORMAT: the plain ASCII token stream written by
-// `lm.initial_data.validation.export_grteclyn` (`format 1`) — `#` comments then
+// `lm.initial_data.validation.export_grteclyn` (`format 2`) — `#` comments then
 // `<key> <values...>` records.  ASCII rather than JSON/HDF5 precisely so that
 // this reader needs no library.  The physics content is
 //
@@ -21,11 +21,22 @@
 // with punctures A at (0,0,+b) and B at (0,0,-b) relative to the grid centre,
 // and `u` given on the ABT prolate-spheroidal grid as
 //
-//     u(A,B,phi) = sum_t C[i][j][t] cos(cos_m[t] phi)
-//                + sum_t S[i][j][t] sin(sin_m[t] phi)
+//     u(A,B,phi) = sum_t w(cos_m[t],B) C[i][j][t] cos(cos_m[t] phi)
+//                + sum_t w(sin_m[t],B) S[i][j][t] sin(sin_m[t] phi)
 //
-// interpolated in (A,B) by a tensor-product barycentric rule.  See
-// LMInitialData.hpp for the evaluation.
+// where C and S are interpolated in (A,B) by a tensor-product barycentric rule
+// and the axis factor w(k,B) = (1-B^2)^(k/2) is applied AFTERWARDS, at the query
+// point.  See LMInitialData.hpp for the evaluation.
+//
+// WHY THE FACTOR IS NOT BAKED IN (the format-1 -> format-2 change).  The solver's
+// approximation space carries that factor analytically: the wavenumber-k part of
+// u behaves as (1-B^2)^(k/2) at the axis B=+-1, so u itself is not a polynomial
+// in B — for odd k not even smooth there — while u_k/w_k is.  Format 1 shipped
+// the physical coefficients and interpolated them directly, which reproduced the
+// spectral expansion only for k=0 and lost accuracy toward the axis.  Format 2
+// ships the smooth factor, so polynomial interpolation is exact.  The versions
+// are NOT interchangeable: reading a format-2 file with the format-1 rule is
+// silently wrong, which is why the check below is an equality, not a minimum.
 
 #ifndef LMSPECTRALDATA_HPP_
 #define LMSPECTRALDATA_HPP_
@@ -198,10 +209,13 @@ class LMSpectralData
             }
         }
 
-        if (format != 1)
+        if (format != 2)
         {
             amrex::Abort("LMSpectralData: " + filename + " has format " +
-                         std::to_string(format) + ", expected 1");
+                         std::to_string(format) +
+                         ", expected 2 (format 1 shipped the physical "
+                         "coefficients, not the smooth factor, and its data are "
+                         "not interchangeable with these — re-export)");
         }
         m_nA = Na + 1; // Na is the Chebyshev order: Na+1 nodes
         m_nB = Nb;
