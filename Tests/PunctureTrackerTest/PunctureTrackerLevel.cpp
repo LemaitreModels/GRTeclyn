@@ -6,7 +6,6 @@
 // GRTeclyn and test headers
 #include "PunctureTrackerLevel.hpp"
 #include "PunctureTagger.hpp"
-#include "PunctureTracker.hpp"
 
 // doctest header
 #include "doctest.h"
@@ -46,8 +45,11 @@ void PunctureTrackerLevel::initData()
     {
         // need to set the puncture coordinates as we use it for the puncture
         // tagging
-        get_puncture_tracker().set_puncture_coords(
-            simParams().puncture_tracking_initial_coords);
+        GRParmParse puncture_tracking_pp("puncture_tracking");
+        std::array<amrex::Real, AMREX_SPACEDIM * 2UL> initial_puncture_coords;
+        puncture_tracking_pp.get("initial_coords", initial_puncture_coords);
+
+        get_puncture_tracker().set_puncture_coords(initial_puncture_coords);
         // can't call start_from_initial_punctures() because we need the full
         // AMR grid first
     }
@@ -57,7 +59,7 @@ void PunctureTrackerLevel::initData()
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void PunctureTrackerLevel::specificEvalRHS(amrex::MultiFab &a_soln,
                                            amrex::MultiFab &a_rhs,
-                                           const double /*a_time*/)
+                                           const amrex::Real /*a_time*/)
 {
     // We don't need any evolution in this test.
     a_rhs.setVal(0.0);
@@ -75,10 +77,16 @@ void PunctureTrackerLevel::tag_cells(amrex::TagBoxArray &a_tag_box_array,
 
     puncture_coords = get_puncture_tracker().get_puncture_coords();
 
+    amrex::Real fake_bh1_mass{};
+    amrex::Real fake_bh2_mass{};
+
+    GRParmParse test_pp("test");
+    test_pp.get("fake_bh1_mass", fake_bh1_mass);
+    test_pp.get("fake_bh2_mass", fake_bh2_mass);
+
     PunctureTagger<num_punctures> puncture_tagger(
         Geom().CellSize(0), Level(), get_gramr_ptr()->maxLevel(),
-        puncture_coords,
-        {simParams().fake_bh1_mass, simParams().fake_bh2_mass});
+        puncture_coords, {fake_bh1_mass, fake_bh2_mass});
 
     amrex::ParallelFor(state_new, amrex::IntVect(0),
                        [=] AMREX_GPU_DEVICE(int box_no, int i, int j, int k)
@@ -122,12 +130,25 @@ void PunctureTrackerLevel::check_puncture_tagging()
     const int num_points_theta = 8;
     const int num_points_phi   = 8;
 
-    std::array<amrex::Real, num_punctures> fake_masses{
-        simParams().fake_bh1_mass, simParams().fake_bh2_mass};
-    const amrex::Real fudge_factor = 1.5; // as in PunctureTagger
-    const int max_level            = get_gramr_ptr()->maxLevel();
-    const amrex::Real exponent     = std::min(max_level - Level(), 1);
-    const amrex::Real factor       = fudge_factor * std::pow(2.0, exponent);
+    amrex::Real fake_bh1_mass{};
+    amrex::Real fake_bh2_mass{};
+
+    GRParmParse test_pp("test");
+    test_pp.get("fake_bh1_mass", fake_bh1_mass);
+    test_pp.get("fake_bh2_mass", fake_bh2_mass);
+
+    std::array<amrex::Real, num_punctures> fake_masses{fake_bh1_mass,
+                                                       fake_bh2_mass};
+    GRParmParse puncture_tagging_pp("puncture_tagging");
+    amrex::Real level_separation{};
+    puncture_tagging_pp.get("level_separation", level_separation);
+    amrex::Real finest_level_factor{};
+    puncture_tagging_pp.get("finest_level_factor", finest_level_factor);
+
+    const int max_level        = get_gramr_ptr()->maxLevel();
+    const amrex::Real exponent = max_level - Level();
+    const amrex::Real factor =
+        finest_level_factor * std::pow(level_separation, exponent);
 
     const auto &puncture_coords = get_puncture_tracker().get_puncture_coords();
     const auto &state_new       = get_new_data(state_index);
@@ -202,15 +223,21 @@ void PunctureTrackerLevel::specific_post_checkpoint(
 
 void PunctureTrackerLevel::specificPostTimeStep()
 {
-    if (Level() == simParams().puncture_tracking_level)
+    GRParmParse puncture_tracking_pp("puncture_tracking");
+    int puncture_tracking_level{};
+    puncture_tracking_pp.get("level", puncture_tracking_level);
+
+    if (Level() == puncture_tracking_level)
     {
         bool write_punctures = false;
         amrex::Real cur_time = get_state_data(state_index).curTime();
         amrex::Real dt       = get_gramr_ptr()->dtLevel(Level());
         get_puncture_tracker().track(cur_time, dt, write_punctures);
 
-        auto correct_puncture_coords =
-            simParams().puncture_tracking_initial_coords;
+        GRParmParse puncture_tracking_pp("puncture_tracking");
+        std::array<amrex::Real, AMREX_SPACEDIM * 2UL> correct_puncture_coords;
+        puncture_tracking_pp.get("initial_coords", correct_puncture_coords);
+
         for (int ipuncture = 0; ipuncture < num_punctures; ++ipuncture)
         {
             correct_puncture_coords[ipuncture * AMREX_SPACEDIM + 1] -=

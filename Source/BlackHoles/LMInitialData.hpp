@@ -105,7 +105,7 @@ class LMInitialData
                                                         amrex::Real z) const;
 
     //! Closed-form Bowen-York Ahat^{ij} (momentum + spin, both punctures).
-    [[nodiscard]] AMREX_GPU_HOST_DEVICE Tensor<2, amrex::Real>
+    [[nodiscard]] AMREX_GPU_HOST_DEVICE Tensor::Rank2
     Ahat(amrex::Real x, amrex::Real y, amrex::Real z) const;
 
     //! Abort unless every puncture is clear of a cell centre by `tol` cells.

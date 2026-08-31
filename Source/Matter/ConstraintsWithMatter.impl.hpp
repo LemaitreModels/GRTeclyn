@@ -12,16 +12,14 @@
 
 #include "ConstraintsWithMatter.hpp"
 #include "DimensionDefinitions.hpp"
-#include "GRParmParse.hpp"
 
 template <class matter_t>
 ConstraintsWithMatter<matter_t>::ConstraintsWithMatter(
-    double dx, double G_Newton, int a_c_Ham, const Interval &a_c_Moms,
+    amrex::Real dx, int a_c_Ham, const Interval &a_c_Moms,
     int a_c_Ham_abs_terms /* defaulted*/,
     const Interval &a_c_Moms_abs_terms /*defaulted*/)
     : Constraints(dx, a_c_Ham, a_c_Moms, a_c_Ham_abs_terms, a_c_Moms_abs_terms,
-                  0.0 /*No cosmological constant*/),
-      m_G_Newton(G_Newton)
+                  0.0 /*No cosmological constant*/)
 {
 }
 
@@ -34,28 +32,33 @@ ConstraintsWithMatter<matter_t>::operator()(
     const amrex::CellData<const amrex::Real> &state_cell_data =
         state.cellData(ix, iy, iz);
     typename matter_t::Vars vars(state_cell_data);
-    const typename matter_t::D1Vars d1(ix, iy, iz, state, m_deriv);
-    const Tensor<2, amrex::Real> d2_chi =
-        m_deriv.diff2(ix, iy, iz, state, c_chi);
-    const Tensor<4, amrex::Real> d2_h =
-        m_deriv.diff2_tensor(ix, iy, iz, state, c_h11);
+
+    auto d2_chi = m_deriv.d2_scalar(ix, iy, iz, state, c_chi);
+    auto d2_h   = m_deriv.d2_sym_tensor(ix, iy, iz, state, c_h11);
 
     // Inverse metric and Christoffel symbol
+    auto d1_h        = m_deriv.d1_sym_tensor(ix, iy, iz, state, c_h11);
     const auto h_UU  = CCZ4Geometry::compute_inverse_metric(vars);
-    const auto chris = CCZ4Geometry::compute_christoffel(d1, h_UU);
+    const auto chris = CCZ4Geometry::compute_christoffel(d1_h, h_UU);
 
     // Get the non matter terms for the constraints
-    constraints_t out =
-        constraint_equations(vars, d1, d2_chi, d2_h, h_UU, chris);
+    // This needs d1 chi, K, h, A
+    auto d1_chi   = m_deriv.d1_scalar(ix, iy, iz, state, c_chi);
+    auto d1_Gamma = m_deriv.d1_vector(ix, iy, iz, state, c_Gamma1);
+    auto d1_K     = m_deriv.d1_scalar(ix, iy, iz, state, c_K);
+    auto d1_A     = m_deriv.d1_sym_tensor(ix, iy, iz, state, c_A11);
 
-    // Energy Momentum Tensor
-    const auto emtensor = my_matter.compute_emtensor(vars, d1, h_UU, chris.ULL);
+    constraints_t out = constraint_equations(vars, d1_chi, d1_Gamma, d1_h, d1_K,
+                                             d1_A, d2_chi, d2_h, h_UU, chris);
+
+    const auto source =
+        m_matter.compute_einstein_sources(ix, iy, iz, state, m_deriv, h_UU);
 
     // Hamiltonian constraint
     if (m_c_Ham >= 0 || m_c_Ham_abs_terms >= 0)
     {
-        out.Ham           += -16.0 * M_PI * m_G_Newton * emtensor.rho;
-        out.Ham_abs_terms += 16.0 * M_PI * m_G_Newton * std::abs(emtensor.rho);
+        out.Ham           += -2.0 * source.rho;
+        out.Ham_abs_terms += 2.0 * std::abs(source.rho);
     }
 
     // Momentum constraints
@@ -63,9 +66,8 @@ ConstraintsWithMatter<matter_t>::operator()(
     {
         FOR (i)
         {
-            out.Mom[i] += -8.0 * M_PI * m_G_Newton * emtensor.j[i];
-            out.Mom_abs_terms[i] +=
-                8.0 * M_PI * m_G_Newton * std::abs(emtensor.j[i]);
+            out.Mom(i)           += -source.j(i);
+            out.Mom_abs_terms(i) += std::abs(source.j(i));
         }
     }
     // Write the constraints into the output FArrayBox
@@ -103,11 +105,6 @@ void ConstraintsWithMatter<matter_t>::compute_mf(
     const auto &out_arrays = out_mf.arrays();
     const auto &src_arrays = src_mf.const_arrays();
 
-    GRParmParse pp;
-    amrex::Real G_Newton = 0;
-
-    pp.get("G_Newton", G_Newton, 0);
-
     amrex::Real dx = geomdata.CellSize(0);
     int iham       = dcomp; // Ham
     Interval imom =
@@ -115,16 +112,12 @@ void ConstraintsWithMatter<matter_t>::compute_mf(
 
     AMREX_ALWAYS_ASSERT(ncomp == (1 + AMREX_SPACEDIM));
 
-    ConstraintsWithMatter<matter_t> my_matter_constraints(dx, G_Newton, iham,
-                                                          imom);
+    ConstraintsWithMatter<matter_t> constraints(dx, iham, imom);
 
     amrex::ParallelFor(
         out_mf,
         [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz) noexcept
-        {
-            my_matter_constraints(ix, iy, iz, out_arrays[box_no],
-                                  src_arrays[box_no]);
-        });
+        { constraints(ix, iy, iz, out_arrays[box_no], src_arrays[box_no]); });
 }
 
 #endif /* CONSTRAINTSWITHMATTER_IMPL_HPP_ */

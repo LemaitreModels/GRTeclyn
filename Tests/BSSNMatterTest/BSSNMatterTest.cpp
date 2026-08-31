@@ -18,6 +18,7 @@
 #include "ConstraintsWithMatter.hpp"
 #include "DefaultPotential.hpp"
 #include "GRParmParse.hpp"
+#include "MovingPunctureGauge.hpp"
 #include "ScalarField.hpp"
 
 // AMReX headers
@@ -30,7 +31,6 @@
 #endif
 
 // System headers
-#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -46,7 +46,7 @@ void run_bssn_matter_test()
 
         constexpr int num_cells  = 32;
         constexpr int num_ghosts = 3;
-        constexpr double dx      = 0.5 / (num_cells - 1);
+        constexpr amrex::Real dx = 0.5 / (num_cells - 1);
 
         amrex::Box box(
             amrex::IntVect(0, 0, 0),
@@ -67,6 +67,7 @@ void run_bssn_matter_test()
 
         amrex::MultiFab in_mf{box_array, distribution_mapping, NUM_VARS,
                               num_ghosts, mf_info};
+        in_mf.setVal(0.0); // initialise to zero
 
         const auto &in_array = in_mf.arrays();
 
@@ -87,35 +88,35 @@ void run_bssn_matter_test()
                 random_matter_bssn_initial_data(iv, in_array[ibox], coords);
             });
 
-        CCZ4_params_t<MovingPunctureGaugeWithMatter::params_t> ccz4_params;
-        ccz4_params.kappa1            = 0.0;
-        ccz4_params.kappa2            = 0.0;
-        ccz4_params.kappa3            = 0.0;
-        ccz4_params.shift_Gamma_coeff = 0.75;
-        ccz4_params.lapse_advec_coeff = 1.0;
-        ccz4_params.lapse_power       = 1.0;
-        ccz4_params.lapse_coeff       = 2.0;
-        ccz4_params.shift_advec_coeff = 0.0;
-        ccz4_params.eta               = 1.0;
-
-        amrex::Real sigma = 0.1;
-
-        using DefaultScalarField = ScalarField<DefaultPotential>;
-
-        double G_Newton = 1.0;
         GRParmParse pp;
-        pp.queryAdd("G_Newton", G_Newton);
+        pp.add("ccz4.kappa1", 0.0);
+        pp.add("ccz4.kappa2", 0.0);
+        pp.add("ccz4.kappa3", 0.0);
+        pp.add("ccz4.covariantZ4", true);
 
-        CCZ4RHSWithMatter<DefaultScalarField, MovingPunctureGaugeWithMatter,
-                          FourthOrderDerivatives>
-            current_ccz4_rhs{ccz4_params, dx, sigma, CCZ4RHS<>::USE_BSSN,
-                             G_Newton};
+        pp.add("gauge.shift_Gamma_coeff", 0.75);
+        pp.add("gauge.lapse_advec_coeff", 1.0);
+        pp.add("gauge.lapse_power", 1.0);
+        pp.add("gauge.lapse_coeff", 2.0);
+        pp.add("gauge.shift_advec_coeff", 0.0);
+        pp.add("gauge.eta", 1.0);
+
+        pp.add("evolution.sigma", 0.1);
+        pp.add("ccz4.formulation", CCZ4RHS<>::USE_BSSN);
+
+        using DefaultScalarField =
+            ScalarField<DefaultPotential, FourthOrderDerivatives>;
+
+        CCZ4RHSWithMatter<DefaultScalarField, FourthOrderDerivatives>
+            current_ccz4_rhs{dx};
+        MovingPunctureGauge<FourthOrderDerivatives> moving_puncture_gauge(dx);
 
         // Set up the constraints
-        constexpr int dcomp = NUM_VARS;
+        constexpr int num_bssn_matter_vars = c_Pi + 1;
+        constexpr int dcomp                = num_bssn_matter_vars;
 
         int num_comp_constraints = 1 + AMREX_SPACEDIM; // ham + moms
-        int num_comp             = NUM_VARS + num_comp_constraints;
+        int num_comp             = num_bssn_matter_vars + num_comp_constraints;
 
         amrex::MultiFab out_mf{box_array, distribution_mapping, num_comp, 0,
                                mf_info};
@@ -126,17 +127,45 @@ void run_bssn_matter_test()
         const auto &out_mf_array  = out_mf.arrays();
         const auto &out_fab_array = out_fab.array();
 
+        // calculate the vacuum solution
+
+        // NOLINTBEGIN(bugprone-easily-swappable-parameters)
         amrex::ParallelFor(
             out_mf,
             [=] AMREX_GPU_DEVICE(int ibox, int ix, int iy, int iz)
             {
-                current_ccz4_rhs(ix, iy, iz, out_mf_array[ibox],
-                                 in_c_array[ibox]);
+                current_ccz4_rhs.compute_chi_and_h_ij(
+                    ix, iy, iz, out_mf_array[ibox], in_c_array[ibox]);
             });
 
-        double time = 0.0;
-        int *bcrec  = nullptr;
-        int level   = 0;
+        amrex::ParallelFor(
+            out_mf,
+            [=] AMREX_GPU_DEVICE(int ibox, int ix, int iy, int iz)
+            {
+                current_ccz4_rhs.compute_A_ij_and_Theta_and_Gamma(
+                    ix, iy, iz, out_mf_array[ibox], in_c_array[ibox]);
+            });
+        // Calculate the emtensor contribution before the gauge update so that
+        // the B-field RHS uses the complete Gamma RHS. But the  B-field RHS
+        // does not depend on matter_rhs.
+        amrex::ParallelFor(
+            out_mf,
+            [=] AMREX_GPU_DEVICE(int ibox, int ix, int iy, int iz)
+            {
+                current_ccz4_rhs.add_emtensor_rhs(
+                    ix, iy, iz, out_mf_array[ibox], in_c_array[ibox]);
+                moving_puncture_gauge.calculate_rhs(
+                    ix, iy, iz, out_mf_array[ibox], in_c_array[ibox]);
+                current_ccz4_rhs.add_matter_rhs(ix, iy, iz, out_mf_array[ibox],
+                                                in_c_array[ibox]);
+                current_ccz4_rhs.apply_dissipation(
+                    ix, iy, iz, out_mf_array[ibox], in_c_array[ibox]);
+            });
+
+        // NOLINTEND(bugprone-easily-swappable-parameters)
+        amrex::Real time = 0.0;
+        int *bcrec       = nullptr;
+        int level        = 0;
 
         ConstraintsWithMatter<DefaultScalarField>::compute_mf(
             out_mf, dcomp, num_comp_constraints, in_mf, geom, time, bcrec,
@@ -149,8 +178,11 @@ void run_bssn_matter_test()
 
 #if AMREX_USE_HDF5
 
-        amrex::Vector<std::string> var_names = ArrayTools::concatenate(
-            StateVariables::names, Constraints::var_names);
+        amrex::Vector<std::string> bssn_matter_names(
+            StateVariables::names.begin(),
+            StateVariables::names.begin() + num_bssn_matter_vars);
+        amrex::Vector<std::string> var_names =
+            ArrayTools::concatenate(bssn_matter_names, Constraints::var_names);
 
         std::string grteclyn_hdf5_file = "BSSNMatterTest/BSSNMatterTest";
 

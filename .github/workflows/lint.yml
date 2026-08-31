@@ -15,6 +15,7 @@ jobs:
       AMREX_HOME: ${{ github.workspace }}/amrex
       BINARYBH_EXAMPLE_DIR: ${{ github.workspace }}/GRTeclyn/Examples/BinaryBH
       KG_EXAMPLE_DIR: ${{ github.workspace }}/GRTeclyn/Examples/KleinGordon
+      SCALARFIELD_EXAMPLE_DIR: ${{ github.workspace }}/GRTeclyn/Examples/ScalarField
       TESTS_DIR: ${{ github.workspace }}/GRTeclyn/Tests
       TMP_BUILD_DIR: ${{ github.workspace }}/GRTeclyn/tmp_build_dir
       COMPILATION_DATABASE: ${{ github.workspace }}/GRTeclyn/compile_commands.json
@@ -61,6 +62,8 @@ jobs:
         compiledb -o ${{ env.COMPILATION_DATABASE }} -n make ${{ env.BUILD_ARGS }}
         cd ${{ env.KG_EXAMPLE_DIR }}
         compiledb -o ${{ env.COMPILATION_DATABASE }} -n make ${{ env.BUILD_ARGS }}
+        cd ${{ env.SCALARFIELD_EXAMPLE_DIR }}
+        compiledb -o ${{ env.COMPILATION_DATABASE }} -n make ${{ env.BUILD_ARGS }}
         cd ${{ env.TESTS_DIR }}
         compiledb -o ${{ env.COMPILATION_DATABASE }} -n make ${{ env.BUILD_ARGS }}
 
@@ -79,9 +82,11 @@ jobs:
     - name: Generate list of files for clang-tidy to ignore
       id: ignore-tidy-list
       run: |
-        # The first sed removes comments and blank lines. The second joins lines
-        # and replaces new lines with a '|'.
-        echo "ignore-tidy=$(sed '/^[[:blank:]]*#/d;s/#.*//;/^$/d;' .lint-ignore |\
+        # The first sed removes comments, blank lines and the lint-only prefix.
+        # The second joins lines and replaces new lines with a '|'.
+        echo "ignore-tidy=$(sed \
+        '/^[[:blank:]]*#/d;s/#.*//;/^$/d;s/^[[:blank:]]*lint-only:[[:blank:]]*//;' \
+        .lint-ignore |\
         sed ':a;N;$!ba;s/\n/|/g')" > $GITHUB_OUTPUT
       working-directory: GRTeclyn
 
@@ -107,4 +112,3 @@ jobs:
     - name: Fail job if checks fail
       if: steps.linter.outputs.checks-failed > 0
       run: exit 1
-

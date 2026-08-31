@@ -37,11 +37,11 @@ class ParticleInterpolatorLevel : public GRAMRLevel
         auto const &geom       = Geom();
         auto const prob_lo     = geom.ProbLoArray();
         auto const dx          = geom.CellSizeArray();
-        const int c_polystate  = 0; // index
 
-        std::array<double, AMREX_SPACEDIM> center{AMREX_D_DECL(0., 0., 0.)};
+        std::array<amrex::Real, AMREX_SPACEDIM> center{
+            AMREX_D_DECL(0., 0., 0.)};
         GRParmParse pp;
-        pp.query("center", center);
+        pp.query("geometry.center", center);
 
         // Fill the state
         amrex::ParallelFor(
@@ -52,13 +52,10 @@ class ParticleInterpolatorLevel : public GRAMRLevel
                 const auto &array = arrs[box_no];
 
                 // compute coordinates
-                amrex::Real x = prob_lo[0] + (i + 0.5) * dx[0] - center[0];
-
-                // zero out everything first
-                array(i, j, k, c_polystate) = 0.0;
+                amrex::Real z = prob_lo[2] + (k + 0.5) * dx[2] - center[2];
 
                 // write in
-                array(i, j, k, c_polystate) = x * x * x;
+                array(i, j, k, c_polystate) = z * z * z;
             });
 
         amrex::Gpu::streamSynchronize();
@@ -66,7 +63,7 @@ class ParticleInterpolatorLevel : public GRAMRLevel
 
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void specificEvalRHS(amrex::MultiFab &a_soln, amrex::MultiFab &a_rhs,
-                         const double a_time) override
+                         const amrex::Real a_time) override
     {
     }
 
@@ -78,15 +75,10 @@ class ParticleInterpolatorLevel : public GRAMRLevel
         const auto &tag_arrs   = a_tag_box_array.arrays();
         const auto &state_arrs = state_new.arrays();
 
-        const amrex::Real dx         = Geom().CellSize(0);
-        const int current_level      = Level();
-        const amrex::Real box_length = Geom().ProbLength(0);
-        std::array<double, AMREX_SPACEDIM> center{AMREX_D_DECL(0., 0., 0.)};
-        GRParmParse pp;
-        pp.query("center", center);
+        const amrex::Real dx    = Geom().CellSize(0);
+        const int current_level = Level();
 
-        FixedGridsTagger my_tagging_criterion{dx, current_level, box_length,
-                                              center};
+        FixedGridsTagger my_tagging_criterion{dx, current_level};
 
         // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
         amrex::ParallelFor(

@@ -40,8 +40,6 @@ class GRAMRLevel : public amrex::AmrLevel
 
     ~GRAMRLevel() override;
 
-    static const SimulationParameters &simParams();
-
     GRAMR *get_gramr_ptr();
 
     /**
@@ -147,7 +145,7 @@ class GRAMRLevel : public amrex::AmrLevel
 
     virtual void specificEvalRHS(amrex::MultiFab &a_soln,
                                  amrex::MultiFab &a_rhs,
-                                 const double a_time) = 0;
+                                 const amrex::Real a_time) = 0;
 
     virtual void specificUpdateODE(amrex::MultiFab & /*a_soln*/) {}
 
@@ -193,12 +191,15 @@ class GRAMRLevel : public amrex::AmrLevel
 
     BoundaryConditions m_boundaries; // the class for implementing BCs
 
-    int m_verbosity = 0; //!< Level of verbosity of the output
-    int m_num_ghosts{};  //!< Number of ghost cells
+    bool nan_check{};
 
   private:
 
     GRAMR *m_gramr_ptr = nullptr;
+
+  protected:
+
+    int m_evolution_spatial_derivative_order = 4; // default to 4th order
 };
 
 #endif /* GRAMRLEVEL_HPP_ */

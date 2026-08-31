@@ -156,11 +156,11 @@ LMInitialData::psi(amrex::Real x, amrex::Real y, amrex::Real z) const
 // --------------------------------------------------------------------------
 // Closed-form Bowen-York Ahat^{ij}
 // --------------------------------------------------------------------------
-[[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE Tensor<2, amrex::Real>
+[[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE Tensor::Rank2
 LMInitialData::Ahat(amrex::Real x, amrex::Real y, amrex::Real z) const
 {
-    Tensor<2, amrex::Real> out;
-    FOR (i, j) { out[i][j] = 0.0; }
+    Tensor::Rank2 out;
+    FOR (i, j) { out(i, j) = 0.0; }
 
     for (int puncture = 0; puncture < 2; ++puncture)
     {
@@ -183,7 +183,7 @@ LMInitialData::Ahat(amrex::Real x, amrex::Real y, amrex::Real z) const
             FOR (i, j)
             {
                 const amrex::Real delta = (i == j) ? 1.0 : 0.0;
-                out[i][j] += 1.5 *
+                out(i, j) += 1.5 *
                              (P[i] * n[j] + P[j] * n[i] -
                               (delta - n[i] * n[j]) * Pn) /
                              (r * r);
@@ -197,7 +197,7 @@ LMInitialData::Ahat(amrex::Real x, amrex::Real y, amrex::Real z) const
                                       Sv[0] * n[1] - Sv[1] * n[0]};
             FOR (i, j)
             {
-                out[i][j] += 3.0 * (v[i] * n[j] + n[i] * v[j]) / (r * r * r);
+                out(i, j) += 3.0 * (v[i] * n[j] + n[i] * v[j]) / (r * r * r);
             }
         }
     }
@@ -220,7 +220,7 @@ LMInitialData::operator()(int ix, int iy, int iz,
 
     FOR2_SYM(i, j)
     {
-        cell[VAR_IDX(c_h11, i, j)] = TensorAlgebra::delta(i, j);
+        cell[sym_var_idx(c_h11, i, j)] = TensorAlgebra::delta(i, j);
     }
 
     // A_ij(CCZ4) = chi * K_ij with K_ij = psi^{-2} Ahat_ij, i.e.
@@ -228,10 +228,10 @@ LMInitialData::operator()(int ix, int iy, int iz,
     // BinaryBHInitialData uses.  Ahat is analytically trace-free with h_ij =
     // delta_ij, so no make_trace_free is applied here either: this keeps the
     // two initial-data paths differing ONLY in psi and Ahat.
-    Tensor<2, amrex::Real> Ahat_here = Ahat(coords.x, coords.y, coords.z);
+    Tensor::Rank2 Ahat_here = Ahat(coords.x, coords.y, coords.z);
     FOR2_SYM(i, j)
     {
-        cell[VAR_IDX(c_A11, i, j)] = std::pow(chi, 1.5) * Ahat_here[i][j];
+        cell[sym_var_idx(c_A11, i, j)] = std::pow(chi, 1.5) * Ahat_here(i, j);
     }
 
     switch (m_params.initial_lapse)
@@ -307,10 +307,10 @@ LMInitialData::validate(const std::string &reference_file) const
             a[5];
         // The table is in puncture-centred coordinates, so evaluate directly.
         dpsi_max = std::max(dpsi_max, std::abs(psi(x, y, z) - psi_ref));
-        Tensor<2, amrex::Real> A = Ahat(x, y, z);
+        Tensor::Rank2 A = Ahat(x, y, z);
         const double ref[6] = {a[0], a[1], a[2], a[3], a[4], a[5]};
-        const double got[6] = {A[0][0], A[0][1], A[0][2],
-                               A[1][1], A[1][2], A[2][2]};
+        const double got[6] = {A(0, 0), A(0, 1), A(0, 2),
+                               A(1, 1), A(1, 2), A(2, 2)};
         for (int k = 0; k < 6; ++k)
         {
             dA_max = std::max(dA_max, std::abs(got[k] - ref[k]));

@@ -4,19 +4,21 @@
  */
 
 #include "BinaryBHLevel.hpp"
+
+#include "AlgebraicConstraintsEnforcer.hpp"
 #include "BinaryBHInitialData.hpp"
 #include "CCZ4RHS.hpp"
 #include "ChiTagger.hpp"
 #include "ConstraintNorms.hpp"
 #include "Constraints.hpp"
 #include "ExtractionTagger.hpp"
+#include "FourthOrderDerivatives.hpp"
 #include "LMInitialData.hpp"
 #include "LMSpectralData.hpp"
 #include "PositiveChiAndLapse.hpp"
 #include "PunctureTagger.hpp"
 #include "PunctureTracker.hpp"
-// xxxxx #include "SixthOrderDerivatives.hpp"
-#include "TraceARemoval.hpp"
+#include "SixthOrderDerivatives.hpp"
 #include "TwoPuncturesInitialData.hpp"
 #include "Weyl4.hpp"
 #include "WeylExtraction.hpp"
@@ -51,14 +53,16 @@ void BinaryBHLevel::specificAdvance()
     const auto &state_arrays   = state_new.arrays();
 
     // The classes to be used
-    TraceARemoval trace_A_removal;
+    AlgebraicConstraintsEnforcer algebraic_constraints_enforcer;
     PositiveChiAndLapse positive_chi_lapse;
 
-    // Enforce the trace free A_ij condition and positive chi and lapse
+    // Enforce det(h)=1, the trace free A_ij condition and positive chi and
+    // lapse
     amrex::ParallelFor(state_new,
                        [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
                        {
-                           trace_A_removal(ix, iy, iz, state_arrays[box_no]);
+                           algebraic_constraints_enforcer(ix, iy, iz,
+                                                          state_arrays[box_no]);
                            positive_chi_lapse(ix, iy, iz, state_arrays[box_no]);
                        });
 }
@@ -68,34 +72,93 @@ void BinaryBHLevel::specificAdvance()
 void BinaryBHLevel::initData()
 {
     BL_PROFILE("BinaryBHLevel::initialData");
-    if (m_verbosity > 0)
+    if (get_gramr_ptr()->Verbose() > 0)
     {
         amrex::Print() << "BinaryBHLevel::initialData " << Level() << "\n";
     }
 #ifdef USE_TWOPUNCTURES
-    // xxxxx USE_TWOPUNCTURES todo
-    TwoPuncturesInitialData two_punctures_initial_data(
-        m_dx, m_p.center, m_tp_amr.m_two_punctures);
-    // Can't use simd with this initial data
-    BoxLoops::loop(two_punctures_initial_data, m_state_new, m_state_new,
-                   INCLUDE_GHOST_CELLS, disable_simd());
+    TwoPuncturesInitialData two_punctures_initial_data(Geom().CellSize(0));
+
+    two_punctures_initial_data.solve(); // only solves first time
+
+    amrex::MultiFab &state_new = get_new_data(state_index);
+#ifdef AMREX_USE_GPU
+    amrex::MFInfo mf_info;
+    mf_info.SetArena(amrex::The_Cpu_Arena());
+    amrex::MultiFab host_state(state_new.boxArray(),
+                               state_new.DistributionMap(), state_new.nComp(),
+                               state_new.nGrowVect(), mf_info);
 #else
-    double dx = Geom().CellSize(0);
+    amrex::MultiFab &host_state = state_new;
+#endif
+
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+    for (amrex::MFIter mfi(state_new, amrex::TilingIfNotGPU()); mfi.isValid();
+         ++mfi)
+    {
+        const amrex::Box &grown_tile_box = mfi.growntilebox();
+        const auto &state_array          = host_state.array(mfi);
+
+        amrex::LoopOnCpu(
+            grown_tile_box, [=](int ix, int iy, int iz)
+            { two_punctures_initial_data(ix, iy, iz, state_array); });
+#ifdef AMREX_USE_GPU
+        // Copy to device
+        amrex::Gpu::htod_memcpy_async(
+            state_new[mfi].dataPtr(), host_state[mfi].dataPtr(),
+            host_state[mfi].size() * sizeof(amrex::Real));
+#endif
+    }
+
+#else
+    amrex::Real dx = Geom().CellSize(0);
     // First set everything to zero (to avoid undefinded values in constraints)
     // then calculate initial data
     amrex::MultiFab &state_new = get_new_data(state_index);
     const auto &state_arrays   = state_new.arrays();
 
-    if (!simParams().lm_id_file.empty())
+    // LM-initial-data parameters.  Upstream PR #215 (refactor_params2) removed
+    // SimulationParameters' data members, so these are read here, at the point
+    // of use, from a prefixed table — the pattern upstream itself now uses (cf.
+    // GRParmParse("puncture_tracking") below).  Keys are "lm.*" so they cannot
+    // collide with an upstream key now or later.
+    GRParmParse lm_pp("lm");
+    std::string lm_id_file;
+    lm_pp.queryAdd("id_file", lm_id_file);
+
+    if (!lm_id_file.empty())
     {
+        // Deliberately `get`, not `queryAdd`: once lm.id_file is set the run is
+        // an LM-ID run, and a mistyped companion key must abort rather than
+        // silently take a default.  Silent defaulting is exactly how the
+        // parameter rename in PR #215 bites (see GRTECLYN_UPDATE_BRIEF.md).
+        std::string lm_id_reference_file;
+        amrex::Real lm_id_reference_tol = 1.0e-10;
+        lm_pp.queryAdd("id_reference_file", lm_id_reference_file);
+        lm_pp.queryAdd("id_reference_tol", lm_id_reference_tol);
+
+        // Domain centre.  BaseParameterChecker::check_params() computes the
+        // default — including the shift for reflective boundaries — and
+        // queryAdd()s it into the "geometry" table at startup, so the key is
+        // present by the time initial data is built.  The loop below is only a
+        // fallback for a caller that bypassed check_params.
+        std::array<amrex::Real, AMREX_SPACEDIM> lm_center{};
+        for (int i = 0; i < AMREX_SPACEDIM; ++i)
+        {
+            lm_center[i] = 0.5 * (Geom().ProbLo(i) + Geom().ProbHi(i));
+        }
+        GRParmParse geom_pp("geometry");
+        geom_pp.queryAdd("center", lm_center);
         // LM-initial-data spectral initial data.  Runtime-selected, so this is
         // the SAME executable, stencils and variable conversion as the analytic
         // branch below — the comparison is then of initial data alone.
         // Read once per process (the file is read-only static data used by
         // every level).
-        static const LMSpectralData lm_data(simParams().lm_id_file);
+        static const LMSpectralData lm_data(lm_id_file);
         LMInitialData::params_t lm_params =
-            lm_data.params(simParams().center, Lapse::PRE_COLLAPSED);
+            lm_data.params(lm_center, Lapse::PRE_COLLAPSED);
         LMInitialData lm_initial_data(lm_params, dx);
 
         static_assert(std::is_trivially_copyable_v<LMInitialData>,
@@ -110,12 +173,11 @@ void BinaryBHLevel::initData()
             {
                 amrex::Print() << "LM-ID:" << line << "\n";
             }
-            if (!simParams().lm_id_reference_file.empty())
+            if (!lm_id_reference_file.empty())
             {
-                auto err =
-                    lm_initial_data.validate(simParams().lm_id_reference_file);
-                if (err[0] > simParams().lm_id_reference_tol ||
-                    err[1] > simParams().lm_id_reference_tol)
+                auto err = lm_initial_data.validate(lm_id_reference_file);
+                if (err[0] > lm_id_reference_tol ||
+                    err[1] > lm_id_reference_tol)
                 {
                     amrex::Abort(
                         "LMInitialData: the C++ evaluation disagrees with the "
@@ -139,9 +201,9 @@ void BinaryBHLevel::initData()
     }
     else
     {
-        // Set up the compute class for the BinaryBH initial data
-        BinaryBHInitialData binary_initial_data(simParams().bh1_params,
-                                                simParams().bh2_params, dx);
+        // Set up the compute class for the BinaryBH initial data.  Upstream
+        // PR #215: it reads bh1.*/bh2.* itself, so no params are threaded in.
+        BinaryBHInitialData binary_initial_data(dx);
 
         static_assert(std::is_trivially_copyable_v<BinaryBHInitialData>,
                       "BinaryBHInitialData needs to be device copyable");
@@ -162,15 +224,22 @@ void BinaryBHLevel::initData()
 #endif
     amrex::Gpu::streamSynchronize();
 
-    if (simParams().puncture_tracking_enabled && Level() == 0)
+    if (get_bhamr_ptr()->puncture_tracking_enabled() && Level() == 0)
     {
         // need to set the puncture coordinates as we use it for the puncture
         // tagging
+        BoostedBHInitialData::params_t bh1_params(1);
+        BoostedBHInitialData::params_t bh2_params(2);
+#ifdef USE_TWOPUNCTURES
+        two_punctures_initial_data.set_bh_params(bh1_params, bh2_params);
+#else
+        bh1_params.fill_params();
+        bh2_params.fill_params();
+#endif
+
         get_puncture_tracker().set_puncture_coords(
-            {simParams().bh1_params.center[0], simParams().bh1_params.center[1],
-             simParams().bh1_params.center[2], simParams().bh2_params.center[0],
-             simParams().bh2_params.center[1],
-             simParams().bh2_params.center[2]});
+            {bh1_params.center[0], bh1_params.center[1], bh1_params.center[2],
+             bh2_params.center[0], bh2_params.center[1], bh2_params.center[2]});
         // can't call start_from_initial_punctures() because we need the full
         // AMR grid first
     }
@@ -180,7 +249,7 @@ void BinaryBHLevel::initData()
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void BinaryBHLevel::specificEvalRHS(amrex::MultiFab &a_soln,
                                     amrex::MultiFab &a_rhs,
-                                    const double /*a_time*/)
+                                    const amrex::Real /*a_time*/)
 {
     BL_PROFILE("BinaryBHLevel::specificEvalRHS()");
     const auto &soln_arrays       = a_soln.arrays();
@@ -189,64 +258,112 @@ void BinaryBHLevel::specificEvalRHS(amrex::MultiFab &a_soln,
     const auto soln_ghosts        = a_soln.nGrowVect();
 
     // The classes to be used
-    TraceARemoval trace_A_removal;
+    AlgebraicConstraintsEnforcer algebraic_constraints_enforcer;
     PositiveChiAndLapse positive_chi_lapse;
 
-    // Enforce positive chi and lapse and trace free A
+    // Enforce positive chi and lapse, det(h)=1 and trace free A
     amrex::ParallelFor(a_soln, soln_ghosts,
                        [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
                        {
-                           trace_A_removal(ix, iy, iz, soln_arrays[box_no]);
+                           algebraic_constraints_enforcer(ix, iy, iz,
+                                                          soln_arrays[box_no]);
                            positive_chi_lapse(ix, iy, iz, soln_arrays[box_no]);
                        });
 
-    // Calculate CCZ4 right hand side
-    if (simParams().max_spatial_derivative_order == 4)
+    // Calculate CCZ4 right hand side using dynamic derivative order
+    if (m_evolution_spatial_derivative_order == 4)
     {
-        CCZ4RHS<MovingPunctureGauge, FourthOrderDerivatives> ccz4rhs(
-            simParams().ccz4_params, Geom().CellSize(0), simParams().sigma,
-            simParams().formulation);
+        CCZ4RHS<FourthOrderDerivatives> ccz4rhs(Geom().CellSize(0));
+        MovingPunctureGauge<FourthOrderDerivatives> moving_puncture_gauge(
+            Geom().CellSize(0));
+
+        // NB: These are split up to avoid having to pre-compute all the
+        //  first and second derivatives in memory on the GPU at once.
 
         amrex::ParallelFor(
             a_rhs,
             [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
             {
-                ccz4rhs(ix, iy, iz, rhs_arrays[box_no],
-                        const_soln_arrays[box_no]);
+                ccz4rhs.compute_chi_and_h_ij(ix, iy, iz, rhs_arrays[box_no],
+                                             const_soln_arrays[box_no]);
+            });
+
+        amrex::ParallelFor(
+            a_rhs,
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                ccz4rhs.compute_A_ij_and_Theta_and_Gamma(
+                    ix, iy, iz, rhs_arrays[box_no], const_soln_arrays[box_no]);
+            });
+
+        amrex::ParallelFor(
+            a_rhs,
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                moving_puncture_gauge.calculate_rhs(
+                    ix, iy, iz, rhs_arrays[box_no], const_soln_arrays[box_no]);
+
+                ccz4rhs.apply_dissipation(ix, iy, iz, rhs_arrays[box_no],
+                                          const_soln_arrays[box_no]);
             });
     }
-    else if (simParams().max_spatial_derivative_order == 6)
+    else if (m_evolution_spatial_derivative_order == 6)
     {
-        amrex::Abort("xxxxx max_spatial_derivative_order == 6 todo");
-#if 0
-        CCZ4RHS<MovingPunctureGauge, SixthOrderDerivatives>
-            ccz4rhs(simParams().ccz4_params, Geom().CellSize(0), simParams().sigma,
-                    simParams().formulation);
-        amrex::ParallelFor(a_rhs,
-        [=] AMREX_GPU_DEVICE (int box_no, int ix, int iy, int iz)
-        {
-            amrex::CellData<amrex::Real const> state = const_soln_arrays[box_no].cellData(i,j,k);
-            amrex::CellData<amrex::Real> rhs = rhs_arrays[box_no].cellData(ix,iy,iz);
-            ccz4rhs.compute(rhs, state);
-        });
-#endif
+        CCZ4RHS<SixthOrderDerivatives> ccz4rhs(Geom().CellSize(0));
+        MovingPunctureGauge<SixthOrderDerivatives> moving_puncture_gauge(
+            Geom().CellSize(0));
+
+        // NB: These are split up to avoid having to pre-compute all the
+        //  first and second derivatives in memory on the GPU at once.
+
+        amrex::ParallelFor(
+            a_rhs,
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                ccz4rhs.compute_chi_and_h_ij(ix, iy, iz, rhs_arrays[box_no],
+                                             const_soln_arrays[box_no]);
+            });
+
+        amrex::ParallelFor(
+            a_rhs,
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                ccz4rhs.compute_A_ij_and_Theta_and_Gamma(
+                    ix, iy, iz, rhs_arrays[box_no], const_soln_arrays[box_no]);
+            });
+
+        amrex::ParallelFor(
+            a_rhs,
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                moving_puncture_gauge.calculate_rhs(
+                    ix, iy, iz, rhs_arrays[box_no], const_soln_arrays[box_no]);
+
+                ccz4rhs.apply_dissipation(ix, iy, iz, rhs_arrays[box_no],
+                                          const_soln_arrays[box_no]);
+            });
+    }
+    else
+    {
+        amrex::Abort("spatial_derivative_order must be 4 or 6");
     }
 
     amrex::Gpu::streamSynchronize();
 }
 
-// enforce trace removal during RK4 substeps
+// enforce algebraic constraints during RK4 substeps
 void BinaryBHLevel::specificUpdateODE(amrex::MultiFab &a_soln)
 {
 
-    TraceARemoval trace_A_removal;
+    AlgebraicConstraintsEnforcer algebraic_constraints_enforcer;
     const auto soln_ghosts = amrex::IntVect(0); // zero ghost cells
 
-    // Enforce the trace free A_ij condition
+    // Enforce the det(h)=1 and trace free A_ij conditions
     const auto &soln_arrays = a_soln.arrays();
-    amrex::ParallelFor(a_soln, soln_ghosts,
-                       [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
-                       { trace_A_removal(ix, iy, iz, soln_arrays[box_no]); });
+    amrex::ParallelFor(
+        a_soln, soln_ghosts,
+        [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+        { algebraic_constraints_enforcer(ix, iy, iz, soln_arrays[box_no]); });
 
     amrex::Gpu::streamSynchronize();
 }
@@ -256,9 +373,11 @@ void BinaryBHLevel::pre_tag_cells()
     amrex::MultiFab &state_new = get_new_data(state_index);
     const auto current_time    = get_state_data(state_index).curTime();
 
-    // Just fill 2 ghosts for chi to calculate second derivatives
+    // Fill ghosts for chi to calculate second derivatives
+    // 4th-order d2 requires 2 ghost cells
     const int nghost = 2;
     const int ncomp  = 1;
+
     FillPatch(*this, state_new, nghost, current_time, state_index, c_chi,
               ncomp);
 }
@@ -274,25 +393,31 @@ void BinaryBHLevel::tag_cells(amrex::TagBoxArray &a_tag_box_array,
 
     ChiTagger chi_tagger(Geom().CellSize(0), a_regrid_threshold);
 
+    GRParmParse pp;
+    spherical_extraction_params_t extraction_params("weyl_extraction");
+    extraction_params.fill_params();
     ExtractionTagger extraction_tagger(Geom().CellSize(0), Level(),
-                                       simParams().extraction_params,
-                                       simParams().activate_extraction);
+                                       extraction_params);
 
-    const bool puncture_tracking_enabled =
-        simParams().puncture_tracking_enabled;
     constexpr auto num_puncture_coords =
         static_cast<std::size_t>(AMREX_SPACEDIM * num_punctures);
     std::array<amrex::Real, num_puncture_coords> puncture_coords{};
+    const bool puncture_tracking_enabled =
+        get_bhamr_ptr()->puncture_tracking_enabled();
 
     if (puncture_tracking_enabled)
     {
         puncture_coords = get_puncture_tracker().get_puncture_coords();
     }
 
+    amrex::Real bh1_mass{};
+    amrex::Real bh2_mass{};
+    pp.get("bh1.mass", bh1_mass);
+    pp.get("bh2.mass", bh2_mass);
+
     PunctureTagger<num_punctures> puncture_tagger(
         Geom().CellSize(0), Level(), get_gramr_ptr()->maxLevel(),
-        puncture_coords,
-        {simParams().bh1_params.mass, simParams().bh2_params.mass});
+        puncture_coords, {bh1_mass, bh2_mass});
 
     amrex::ParallelFor(state_new, amrex::IntVect(0),
                        [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
@@ -315,7 +440,7 @@ void BinaryBHLevel::specific_post_init()
 {
     BL_PROFILE("BinaryBHLevel::specific_post_init()");
 
-    if (simParams().puncture_tracking_enabled)
+    if (get_bhamr_ptr()->puncture_tracking_enabled() && Level() == 0)
     {
         get_puncture_tracker().start_from_initial_punctures();
     }
@@ -326,13 +451,29 @@ void BinaryBHLevel::specific_post_init()
     // specificPostTimeStep means the run needs no evolution step at all.
     // (The norm block in specificPostTimeStep is still #if 0'd: it uses
     // GRChombo's AMRReductions, which was never ported to AMReX.)
-    if (simParams().calculate_constraint_norms && Level() == 0)
+    GRParmParse lm_norm_pp("lm");
+    bool calculate_constraint_norms = false;
+    lm_norm_pp.queryAdd("calculate_constraint_norms",
+                        calculate_constraint_norms);
+
+    if (calculate_constraint_norms && Level() == 0)
     {
         ConstraintNorms::Options opts;
-        opts.r_excl       = simParams().constraint_norm_exclusion_radius;
-        opts.border_cells = simParams().constraint_norm_border_cells;
-        opts.punctures.push_back(simParams().bh1_params.center);
-        opts.punctures.push_back(simParams().bh2_params.center);
+        lm_norm_pp.queryAdd("constraint_norm_exclusion_radius", opts.r_excl);
+        lm_norm_pp.queryAdd("constraint_norm_border_cells", opts.border_cells);
+
+        // Puncture centres.  Same construction upstream uses for the puncture
+        // tracker: params_t reads bh<N>.* itself via fill_params().
+        BoostedBHInitialData::params_t bh1_params(1);
+        BoostedBHInitialData::params_t bh2_params(2);
+#ifdef USE_TWOPUNCTURES
+        two_punctures_initial_data.set_bh_params(bh1_params, bh2_params);
+#else
+        bh1_params.fill_params();
+        bh2_params.fill_params();
+#endif
+        opts.punctures.push_back(bh1_params.center);
+        opts.punctures.push_back(bh2_params.center);
 
         const amrex::Real time = get_state_data(state_index).curTime();
         auto res = ConstraintNorms::compute(*get_gramr_ptr(), time, opts);
@@ -349,9 +490,13 @@ void BinaryBHLevel::specific_post_init()
         extra << std::setprecision(17);
         extra << "\"n_cell_level0\": "
               << get_gramr_ptr()->getLevel(0).Domain().length(0) << ",";
-        ConstraintNorms::write_json(res,
-                                    simParams().data_path +
-                                        "constraint_norms.json",
+        // NOTE: output location changed with the port.  The old
+        // simParams().data_path is gone; this reads "lm.data_path", default
+        // empty (i.e. the run directory), which is where every campaign job
+        // already looks.
+        std::string lm_data_path;
+        lm_norm_pp.queryAdd("data_path", lm_data_path);
+        ConstraintNorms::write_json(res, lm_data_path + "constraint_norms.json",
                                     time, opts, extra.str());
     }
 }
@@ -360,7 +505,7 @@ void BinaryBHLevel::specific_post_restart()
 {
     BL_PROFILE("BinaryBHLevel::specific_post_restart()");
 
-    if (simParams().puncture_tracking_enabled)
+    if (get_bhamr_ptr()->puncture_tracking_enabled() && Level() == 0)
     {
         std::string restart_checkpoint{};
         GRParmParse pp("amr");
@@ -372,7 +517,7 @@ void BinaryBHLevel::specific_post_restart()
 void BinaryBHLevel::specific_post_plotfile(const std::string &a_dir,
                                            std::ostream &a_os)
 {
-    if (simParams().puncture_tracking_enabled)
+    if (get_bhamr_ptr()->puncture_tracking_enabled() && Level() == 0)
     {
         get_puncture_tracker().write_plotfile(a_dir);
     }
@@ -381,7 +526,7 @@ void BinaryBHLevel::specific_post_plotfile(const std::string &a_dir,
 void BinaryBHLevel::specific_post_checkpoint(const std::string &a_chk_dir,
                                              std::ostream & /*a_os*/)
 {
-    if (simParams().puncture_tracking_enabled)
+    if (get_bhamr_ptr()->puncture_tracking_enabled() && Level() == 0)
     {
         get_puncture_tracker().checkpoint(a_chk_dir);
     }
@@ -391,25 +536,36 @@ void BinaryBHLevel::specificPostTimeStep()
 {
     BL_PROFILE("BinaryBHLevel::specificPostTimeStep");
 
-    // do puncture tracking on requested level
-    if (simParams().puncture_tracking_enabled &&
-        Level() == simParams().puncture_tracking_level)
+    if (get_bhamr_ptr()->puncture_tracking_enabled())
     {
-        BL_PROFILE("PunctureTracking");
+        GRParmParse puncture_tracking_pp("puncture_tracking");
+        int puncture_tracking_level{};
+        puncture_tracking_pp.get("level", puncture_tracking_level);
+        int puncture_tracking_writeout_level{};
+        puncture_tracking_pp.get("writeout_level",
+                                 puncture_tracking_writeout_level);
 
-        // only do the write out when we're at at a multiple of the
-        // writeout_level
-        bool write_punctures = at_level_timestep_multiple(
-            simParams().puncture_tracking_writeout_level);
-        amrex::Real current_time = get_state_data(state_index).curTime();
-        amrex::Real dt           = get_gramr_ptr()->dtLevel(Level());
-        get_puncture_tracker().track(current_time, dt, write_punctures);
+        // do puncture tracking on requested level
+        if (Level() == puncture_tracking_level)
+        {
+            BL_PROFILE("PunctureTracking");
+
+            // only do the write out when we're at at a multiple of the
+            // writeout_level
+            bool write_punctures =
+                at_level_timestep_multiple(puncture_tracking_writeout_level);
+            amrex::Real current_time = get_state_data(state_index).curTime();
+            amrex::Real dt           = get_gramr_ptr()->dtLevel(Level());
+            get_puncture_tracker().track(current_time, dt, write_punctures);
+        }
     }
 
-    // Weyl extraction
-    if (simParams().activate_extraction)
+    spherical_extraction_params_t extraction_params("weyl_extraction");
+    extraction_params.fill_params();
+
+    if (extraction_params.enabled)
     {
-        int min_level = simParams().extraction_params.min_extraction_level();
+        const int min_level = extraction_params.min_extraction_level();
         bool calculate_weyl = at_level_timestep_multiple(min_level);
 
         if (calculate_weyl && Level() == min_level)
@@ -419,36 +575,9 @@ void BinaryBHLevel::specificPostTimeStep()
             amrex::Real restart_time = get_gramr_ptr()->get_restart_time();
             bool first_step          = (m_time <= m_dt);
 
-            WeylExtraction my_extraction(simParams().extraction_params, m_dt,
-                                         m_time, first_step, restart_time);
+            WeylExtraction my_extraction(extraction_params, m_dt, m_time,
+                                         first_step, restart_time);
             my_extraction.execute_query(&get_bhamr_ptr()->m_weyl_interpolator);
         }
     }
-
-#if 0
-//xxxxx specificPostTimeStep
-
-    if (m_p.calculate_constraint_norms)
-    {
-        fillAllGhosts();
-        BoxLoops::loop(Constraints(m_dx, c_Ham, Interval(c_Mom1, c_Mom3)),
-                       m_state_new, m_state_diagnostics, EXCLUDE_GHOST_CELLS);
-        if (m_level == 0)
-        {
-            AMRReductions<VariableType::derived> amr_reductions(m_gr_amr);
-            double L2_Ham = amr_reductions.norm(c_Ham);
-            double L2_Mom = amr_reductions.norm(Interval(c_Mom1, c_Mom3));
-            SmallDataIO constraints_file(m_p.data_path + "constraint_norms",
-                                         m_dt, m_time, m_restart_time,
-                                         SmallDataIO::APPEND, first_step);
-            constraints_file.remove_duplicate_time_data();
-            if (first_step)
-            {
-                constraints_file.write_header_line({"L^2_Ham", "L^2_Mom"});
-            }
-            constraints_file.write_time_data_line({L2_Ham, L2_Mom});
-        }
-    }
-
-#endif
 }
