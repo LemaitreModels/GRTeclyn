@@ -10,6 +10,9 @@
 #include "ConstraintNorms.hpp"
 #include "Constraints.hpp"
 #include "ExtractionTagger.hpp"
+#include "GammaCalculator.hpp"
+#include "LMCurvedInitialData.hpp"
+#include "LMCurvedSpectralData.hpp"
 #include "LMInitialData.hpp"
 #include "LMSpectralData.hpp"
 #include "PositiveChiAndLapse.hpp"
@@ -86,7 +89,74 @@ void BinaryBHLevel::initData()
     amrex::MultiFab &state_new = get_new_data(state_index);
     const auto &state_arrays   = state_new.arrays();
 
-    if (!simParams().lm_id_file.empty())
+    if (!simParams().lm_curved_id_file.empty())
+    {
+        // LM-initial-data CONFORMALLY CURVED spectral initial data (format 3,
+        // spinning-at-rest sector).  Runtime-selected like the flat channel
+        // below, and mutually exclusive with it.
+        if (!simParams().lm_id_file.empty())
+        {
+            amrex::Abort("BinaryBHLevel: lm_id_file and lm_curved_id_file are "
+                         "mutually exclusive — pick one initial-data channel");
+        }
+        static const LMCurvedSpectralData lm_curved_data(
+            simParams().lm_curved_id_file);
+        LMCurvedInitialData::params_t lm_params =
+            lm_curved_data.params(simParams().center, Lapse::PRE_COLLAPSED);
+        LMCurvedInitialData lm_initial_data(lm_params, dx);
+
+        static_assert(std::is_trivially_copyable_v<LMCurvedInitialData>,
+                      "LMCurvedInitialData needs to be device copyable");
+
+        // psi_QI diverges at the punctures: refuse a grid that samples one.
+        LMCurvedInitialData::validate_staggering(lm_params, dx);
+
+        if (Level() == 0)
+        {
+            for (const auto &line : lm_curved_data.provenance())
+            {
+                amrex::Print() << "LM-curved-ID:" << line << "\n";
+            }
+            if (!simParams().lm_curved_id_reference_file.empty())
+            {
+                auto err = lm_initial_data.validate(
+                    simParams().lm_curved_id_reference_file);
+                const double tol = simParams().lm_curved_id_reference_tol;
+                if (err[0] > tol || err[1] > tol || err[2] > tol ||
+                    err[3] > tol)
+                {
+                    amrex::Abort(
+                        "LMCurvedInitialData: the C++ reconstruction disagrees "
+                        "with the exported reference table beyond "
+                        "lm_curved_id_reference_tol");
+                }
+            }
+        }
+
+        amrex::ParallelFor(
+            state_new, state_new.nGrowVect(),
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                amrex::CellData<amrex::Real> cell =
+                    state_arrays[box_no].cellData(ix, iy, iz);
+                for (int n = 0; n < cell.nComp(); ++n)
+                {
+                    cell[n] = 0.;
+                }
+                lm_initial_data(ix, iy, iz, state_arrays[box_no]);
+            });
+
+        // Gamma^i of the curved conformal metric.  Every other branch has
+        // h_ij = delta so Gamma^i = 0 and the zero-fill above is exact; here
+        // it is not, and the stock GammaCalculator computes it from the h_ij
+        // just written.  The ParallelFor above filled the ghost cells by
+        // direct evaluation (nGrowVect), so the derivative stencils are valid
+        // without a FillPatch.
+        amrex::Gpu::streamSynchronize();
+        BoxLoops::loop(GammaCalculator(m_dx), state_new, state_new,
+                       EXCLUDE_GHOST_CELLS);
+    }
+    else if (!simParams().lm_id_file.empty())
     {
         // LM-initial-data spectral initial data.  Runtime-selected, so this is
         // the SAME executable, stencils and variable conversion as the analytic

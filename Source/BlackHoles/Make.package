@@ -3,6 +3,9 @@ GRTECLYN_CEXE_headers += BHAMR.hpp \
                          BinaryBHInitialData.impl.hpp \
                          BoostedBHInitialData.hpp \
                          BoostedBHInitialData.impl.hpp \
+                         LMCurvedInitialData.hpp \
+                         LMCurvedInitialData.impl.hpp \
+                         LMCurvedSpectralData.hpp \
                          LMInitialData.hpp \
                          LMInitialData.impl.hpp \
                          LMSpectralData.hpp \

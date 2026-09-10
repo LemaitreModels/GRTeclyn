@@ -61,6 +61,17 @@ class SimulationParameters : public SimulationParametersBase
         pp.load("lm_id_file", lm_id_file, std::string(""));
         pp.load("lm_id_reference_file", lm_id_reference_file, std::string(""));
         pp.load("lm_id_reference_tol", lm_id_reference_tol, 1.0e-10);
+
+        // LM-initial-data CURVED spectral initial data
+        // (LMCurvedInitialData.hpp, format 3: conformally curved
+        // quasi-isotropic Kerr punctures, spinning-at-rest sector).  Same
+        // runtime-switch design as lm_id_file; the two are mutually exclusive
+        // and BinaryBHLevel aborts if both are set.
+        pp.load("lm_curved_id_file", lm_curved_id_file, std::string(""));
+        pp.load("lm_curved_id_reference_file", lm_curved_id_reference_file,
+                std::string(""));
+        pp.load("lm_curved_id_reference_tol", lm_curved_id_reference_tol,
+                1.0e-10);
     }
 
 #ifdef USE_TWOPUNCTURES
@@ -341,6 +352,9 @@ class SimulationParameters : public SimulationParametersBase
     std::string lm_id_file;
     std::string lm_id_reference_file;
     double lm_id_reference_tol{};
+    std::string lm_curved_id_file;
+    std::string lm_curved_id_reference_file;
+    double lm_curved_id_reference_tol{};
 
     // Collection of parameters necessary for initial conditions
     // Set these even in the case of TwoPunctures as they are used elsewhere
