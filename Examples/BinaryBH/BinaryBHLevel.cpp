@@ -10,7 +10,7 @@
 #include "ConstraintNorms.hpp"
 #include "Constraints.hpp"
 #include "ExtractionTagger.hpp"
-#include "GammaCalculator.hpp"
+#include "LMCurvedGammaInit.hpp"
 #include "LMCurvedInitialData.hpp"
 #include "LMCurvedSpectralData.hpp"
 #include "LMInitialData.hpp"
@@ -148,13 +148,23 @@ void BinaryBHLevel::initData()
 
         // Gamma^i of the curved conformal metric.  Every other branch has
         // h_ij = delta so Gamma^i = 0 and the zero-fill above is exact; here
-        // it is not, and the stock GammaCalculator computes it from the h_ij
-        // just written.  The ParallelFor above filled the ghost cells by
-        // direct evaluation (nGrowVect), so the derivative stencils are valid
-        // without a FillPatch.
+        // it is not.  LMCurvedGammaInit is the AMReX-ported GammaCalculator
+        // (the in-tree one is unported heritage code).  The ParallelFor above
+        // filled the ghost cells by direct evaluation (nGrowVect), so the
+        // derivative stencils are valid without a FillPatch; iterate the VALID
+        // region only, reading through a const alias — the write touches only
+        // the Gamma components, so the in-place update is race-free.
         amrex::Gpu::streamSynchronize();
-        BoxLoops::loop(GammaCalculator(m_dx), state_new, state_new,
-                       EXCLUDE_GHOST_CELLS);
+        LMCurvedGammaInit gamma_init(dx);
+        static_assert(std::is_trivially_copyable_v<LMCurvedGammaInit>,
+                      "LMCurvedGammaInit needs to be device copyable");
+        const auto &state_const_arrays = state_new.const_arrays();
+        amrex::ParallelFor(
+            state_new,
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz) {
+                gamma_init(ix, iy, iz, state_arrays[box_no],
+                           state_const_arrays[box_no]);
+            });
     }
     else if (!simParams().lm_id_file.empty())
     {
