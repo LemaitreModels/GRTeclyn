@@ -12,7 +12,10 @@
 #include "ConstraintNorms.hpp"
 #include "Constraints.hpp"
 #include "ExtractionTagger.hpp"
+#include "GammaCalculator.hpp"
 #include "FourthOrderDerivatives.hpp"
+#include "LMCurvedInitialData.hpp"
+#include "LMCurvedSpectralData.hpp"
 #include "LMInitialData.hpp"
 #include "LMSpectralData.hpp"
 #include "PositiveChiAndLapse.hpp"
@@ -126,9 +129,113 @@ void BinaryBHLevel::initData()
     // collide with an upstream key now or later.
     GRParmParse lm_pp("lm");
     std::string lm_id_file;
+    std::string lm_curved_id_file;
     lm_pp.queryAdd("id_file", lm_id_file);
+    lm_pp.queryAdd("curved_id_file", lm_curved_id_file);
 
-    if (!lm_id_file.empty())
+    // Domain centre, hoisted: BOTH LM channels need it, and the flat branch
+    // used to compute it inside its own scope.  BaseParameterChecker::
+    // check_params() computes the default -- including the shift for
+    // reflective boundaries -- and queryAdd()s it into the "geometry" table at
+    // startup, so the key is present by the time initial data is built.  The
+    // loop is only a fallback for a caller that bypassed check_params.
+    std::array<amrex::Real, AMREX_SPACEDIM> lm_center{};
+    for (int i = 0; i < AMREX_SPACEDIM; ++i)
+    {
+        lm_center[i] = 0.5 * (Geom().ProbLo(i) + Geom().ProbHi(i));
+    }
+    GRParmParse geom_pp("geometry");
+    geom_pp.queryAdd("center", lm_center);
+
+    // Curved channel FIRST, and mutually exclusive with the flat one.
+    if (!lm_curved_id_file.empty())
+    {
+        // LM-initial-data CONFORMALLY CURVED spectral initial data (format 3,
+        // spinning-at-rest sector).  Runtime-selected like the flat channel
+        // below, and mutually exclusive with it.
+        if (!lm_id_file.empty())
+        {
+            amrex::Abort("BinaryBHLevel: lm.id_file and lm.curved_id_file are "
+                         "mutually exclusive — pick one initial-data channel");
+        }
+
+        // Companion keys, read at point of use like the flat channel above.
+        std::string lm_curved_id_reference_file;
+        amrex::Real lm_curved_id_reference_tol = 1.0e-10;
+        lm_pp.queryAdd("curved_id_reference_file", lm_curved_id_reference_file);
+        lm_pp.queryAdd("curved_id_reference_tol", lm_curved_id_reference_tol);
+
+        static const LMCurvedSpectralData lm_curved_data(
+            lm_curved_id_file);
+        LMCurvedInitialData::params_t lm_params =
+            lm_curved_data.params(lm_center, Lapse::PRE_COLLAPSED);
+        LMCurvedInitialData lm_initial_data(lm_params, dx);
+
+        static_assert(std::is_trivially_copyable_v<LMCurvedInitialData>,
+                      "LMCurvedInitialData needs to be device copyable");
+
+        // psi_QI diverges at the punctures: refuse a grid that samples one.
+        LMCurvedInitialData::validate_staggering(lm_params, dx);
+
+        if (Level() == 0)
+        {
+            for (const auto &line : lm_curved_data.provenance())
+            {
+                amrex::Print() << "LM-curved-ID:" << line << "\n";
+            }
+            if (!lm_curved_id_reference_file.empty())
+            {
+                auto err = lm_initial_data.validate(
+                    lm_curved_id_reference_file);
+                const double tol = lm_curved_id_reference_tol;
+                if (err[0] > tol || err[1] > tol || err[2] > tol ||
+                    err[3] > tol)
+                {
+                    amrex::Abort(
+                        "LMCurvedInitialData: the C++ reconstruction disagrees "
+                        "with the exported reference table beyond "
+                        "lm_curved_id_reference_tol");
+                }
+            }
+        }
+
+        amrex::ParallelFor(
+            state_new, state_new.nGrowVect(),
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            {
+                amrex::CellData<amrex::Real> cell =
+                    state_arrays[box_no].cellData(ix, iy, iz);
+                for (int n = 0; n < cell.nComp(); ++n)
+                {
+                    cell[n] = 0.;
+                }
+                lm_initial_data(ix, iy, iz, state_arrays[box_no]);
+            });
+
+        // Gamma^i of the curved conformal metric.  Every other branch has
+        // h_ij = delta so Gamma^i = 0 and the zero-fill above is exact; here
+        // it is not.  This used LMCurvedGammaInit, a local port written because
+        // the in-tree GammaCalculator was unported heritage code at the old
+        // pin.  Upstream has since ported it (Source/CCZ4/GammaCalculator.hpp),
+        // computing the identical quantity -- h_UU from CCZ4Vars, d1_h via
+        // d1_sym_tensor(..., c_h11), contracted Christoffel into c_Gamma1+i --
+        // and templated on the derivative order, so unlike the local copy it
+        // also works at 6th order.  The local port is therefore deleted rather
+        // than re-ported.  The ParallelFor above filled the ghost cells by
+        // direct evaluation (nGrowVect), so the derivative stencils are valid
+        // without a FillPatch; iterate the VALID region only -- the write
+        // touches only the Gamma components, so the in-place update is
+        // race-free.
+        amrex::Gpu::streamSynchronize();
+        GammaCalculator<> gamma_init(dx);
+        static_assert(std::is_trivially_copyable_v<GammaCalculator<>>,
+                      "GammaCalculator needs to be device copyable");
+        amrex::ParallelFor(
+            state_new,
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            { gamma_init(ix, iy, iz, state_arrays[box_no]); });
+    }
+    else if (!lm_id_file.empty())
     {
         // Deliberately `get`, not `queryAdd`: once lm.id_file is set the run is
         // an LM-ID run, and a mistyped companion key must abort rather than
@@ -139,18 +246,6 @@ void BinaryBHLevel::initData()
         lm_pp.queryAdd("id_reference_file", lm_id_reference_file);
         lm_pp.queryAdd("id_reference_tol", lm_id_reference_tol);
 
-        // Domain centre.  BaseParameterChecker::check_params() computes the
-        // default — including the shift for reflective boundaries — and
-        // queryAdd()s it into the "geometry" table at startup, so the key is
-        // present by the time initial data is built.  The loop below is only a
-        // fallback for a caller that bypassed check_params.
-        std::array<amrex::Real, AMREX_SPACEDIM> lm_center{};
-        for (int i = 0; i < AMREX_SPACEDIM; ++i)
-        {
-            lm_center[i] = 0.5 * (Geom().ProbLo(i) + Geom().ProbHi(i));
-        }
-        GRParmParse geom_pp("geometry");
-        geom_pp.queryAdd("center", lm_center);
         // LM-initial-data spectral initial data.  Runtime-selected, so this is
         // the SAME executable, stencils and variable conversion as the analytic
         // branch below — the comparison is then of initial data alone.

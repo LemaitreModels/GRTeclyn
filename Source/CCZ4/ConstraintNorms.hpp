@@ -42,6 +42,7 @@
 #include <AMReX_MultiFabUtil.H>
 #include <AMReX_ParReduce.H>
 #include <AMReX_REAL.H>
+#include <AMReX_Utility.H>
 
 // System includes
 #include <array>
@@ -306,7 +307,27 @@ inline void write_json(const Result &res, const std::string &filename,
     {
         return;
     }
+    // Create the parent directory if it does not exist yet, and refuse to fail
+    // silently.  At post_init the data subpath has not been created (the
+    // step-time writers make it later), and a default ofstream on a missing
+    // directory fails with every subsequent << a no-op — measured as a missing
+    // constraint_norms.json while the norms print just above succeeded
+    // (lm-curved-smoke job 14263868).
+    const auto slash = filename.find_last_of('/');
+    if (slash != std::string::npos)
+    {
+        const std::string dir = filename.substr(0, slash);
+        if (!dir.empty())
+        {
+            amrex::UtilCreateDirectory(dir, 0755);
+        }
+    }
     std::ofstream f(filename);
+    if (!f)
+    {
+        amrex::Abort("ConstraintNorms::write_json: cannot open " + filename +
+                     " — the norms were computed but would not be recorded");
+    }
     f << std::setprecision(17) << std::scientific;
     f << "{\n";
     if (!extra.empty())
