@@ -472,7 +472,7 @@ void BinaryBHLevel::specific_post_init()
         opts.punctures.push_back(bh2_params.center);
 
         const amrex::Real time = get_state_data(state_index).curTime();
-        auto res = ConstraintNorms::compute(*get_gramr_ptr(), time, opts);
+        auto res = ConstraintNorms::compute(*get_gr_amr_ptr(), time, opts);
 
         amrex::Print() << "Constraint norms at t = " << time
                        << " (volume-normalised rms over leaf cells, "
@@ -485,7 +485,7 @@ void BinaryBHLevel::specific_post_init()
         std::ostringstream extra;
         extra << std::setprecision(17);
         extra << "\"n_cell_level0\": "
-              << get_gramr_ptr()->getLevel(0).Domain().length(0) << ",";
+              << get_gr_amr_ptr()->getLevel(0).Domain().length(0) << ",";
         // NOTE: output location changed with the port.  The old
         // simParams().data_path is gone; this reads "lm.data_path", default
         // empty (i.e. the run directory), which is where every campaign job
