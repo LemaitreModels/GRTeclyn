@@ -120,8 +120,8 @@ class LMCurvedInitialData
     AMREX_GPU_HOST_DEVICE void
     consumer_state(amrex::Real x, amrex::Real y, amrex::Real z,
                    amrex::Real &psi_out, amrex::Real &chi_out,
-                   Tensor<2, amrex::Real> &h_out,
-                   Tensor<2, amrex::Real> &A_out) const;
+                   Tensor::Rank2 &h_out,
+                   Tensor::Rank2 &A_out) const;
 
     //! Abort unless every puncture is clear of a cell centre by `tol` cells.
     static void validate_staggering(const params_t &params, double dx,

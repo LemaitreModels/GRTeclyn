@@ -214,8 +214,8 @@ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void
 LMCurvedInitialData::consumer_state(amrex::Real x, amrex::Real y,
                                     amrex::Real z, amrex::Real &psi_out,
                                     amrex::Real &chi_out,
-                                    Tensor<2, amrex::Real> &h_out,
-                                    Tensor<2, amrex::Real> &A_out) const
+                                    Tensor::Rank2 &h_out,
+                                    Tensor::Rank2 &A_out) const
 {
     const amrex::Real b = m_params.b;
 
@@ -331,8 +331,8 @@ LMCurvedInitialData::consumer_state(amrex::Real x, amrex::Real y,
     chi_out                 = chi;
     FOR (i, j)
     {
-        h_out[i][j] = gt[i][j] * Dm13;
-        A_out[i][j] = scale * At[i][j];
+        h_out(i, j) = gt[i][j] * Dm13;
+        A_out(i, j) = scale * At[i][j];
     }
 }
 
@@ -347,15 +347,15 @@ LMCurvedInitialData::operator()(int ix, int iy, int iz,
     Coordinates coords(amrex::IntVect(ix, iy, iz), m_dx, m_params.center);
 
     amrex::Real psi_here = 0.0, chi = 0.0;
-    Tensor<2, amrex::Real> h_here, A_here;
+    Tensor::Rank2 h_here, A_here;
     consumer_state(coords.x, coords.y, coords.z, psi_here, chi, h_here,
                    A_here);
 
     cell[c_chi] = chi;
     FOR2_SYM(i, j)
     {
-        cell[VAR_IDX(c_h11, i, j)] = h_here[i][j];
-        cell[VAR_IDX(c_A11, i, j)] = A_here[i][j];
+        cell[sym_var_idx(c_h11, i, j)] = h_here(i, j);
+        cell[sym_var_idx(c_A11, i, j)] = A_here(i, j);
     }
     // K == 0 exactly in this sector (maximal slicing per hole survives the
     // attenuated sum); the caller has zeroed every component already, so K,
@@ -440,7 +440,7 @@ LMCurvedInitialData::validate(const std::string &reference_file) const
             ss >> v;
         }
         amrex::Real psi_got = 0.0, chi_got = 0.0;
-        Tensor<2, amrex::Real> h_got, A_got;
+        Tensor::Rank2 h_got, A_got;
         consumer_state(x, y, z, psi_got, chi_got, h_got, A_got);
         dpsi = std::max(dpsi, std::abs(psi_got - psi_ref));
         dchi = std::max(dchi, std::abs(chi_got - chi_ref));
@@ -448,8 +448,8 @@ LMCurvedInitialData::validate(const std::string &reference_file) const
         const int ju[6] = {0, 1, 2, 1, 2, 2};
         for (int k = 0; k < 6; ++k)
         {
-            dh = std::max(dh, std::abs(h_got[iu[k]][ju[k]] - h_ref[k]));
-            dA = std::max(dA, std::abs(A_got[iu[k]][ju[k]] - A_ref[k]));
+            dh = std::max(dh, std::abs(h_got(iu[k], ju[k]) - h_ref[k]));
+            dA = std::max(dA, std::abs(A_got(iu[k], ju[k]) - A_ref[k]));
         }
         ++n;
     }
