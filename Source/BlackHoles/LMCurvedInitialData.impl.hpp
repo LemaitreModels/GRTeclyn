@@ -14,11 +14,14 @@
 #include "TensorAlgebra.hpp"
 
 #include <AMReX.H>
+#include <AMReX_GpuContainers.H>
+#include <AMReX_GpuLaunch.H>
 
 #include <cmath>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 // --------------------------------------------------------------------------
 // Barycentric interpolation (same rule as LMInitialData::bary)
@@ -418,8 +421,9 @@ LMCurvedInitialData::validate(const std::string &reference_file) const
         amrex::Abort("LMCurvedInitialData::validate: cannot open " +
                      reference_file);
     }
-    double dpsi = 0.0, dchi = 0.0, dh = 0.0, dA = 0.0;
-    long n = 0;
+    // Parse the table on the host ...
+    std::vector<amrex::Real> pts;  // x y z per point
+    std::vector<double> ref;       // psi chi h[6] A[6] per point (14)
     std::string line;
     while (std::getline(f, line))
     {
@@ -428,30 +432,64 @@ LMCurvedInitialData::validate(const std::string &reference_file) const
             continue;
         }
         std::istringstream ss(line);
-        double x = 0, y = 0, z = 0, psi_ref = 0, chi_ref = 0;
-        double h_ref[6] = {}, A_ref[6] = {};
-        ss >> x >> y >> z >> psi_ref >> chi_ref;
-        for (double &v : h_ref)
+        double v[17] = {};
+        for (double &x : v)
         {
-            ss >> v;
+            ss >> x;
         }
-        for (double &v : A_ref)
+        pts.insert(pts.end(), v, v + 3);
+        ref.insert(ref.end(), v + 3, v + 17);
+    }
+    const int n = static_cast<int>(pts.size() / 3);
+
+    // ... and evaluate it ON THE DEVICE.  The spectral coefficients live in
+    // amrex::Gpu::DeviceVector (LMCurvedSpectralData), so a host-side
+    // consumer_state() dereferences device memory: harmless on a CPU build,
+    // where the two coincide, and a segfault on a CUDA one (Hortense jobs
+    // 14416403/14416404).  Evaluating through the same device path that
+    // builds the state also makes this check test the code that actually ran.
+    amrex::Gpu::DeviceVector<amrex::Real> d_pts(pts.size());
+    amrex::Gpu::DeviceVector<amrex::Real> d_out(static_cast<std::size_t>(14) * n);
+    amrex::Gpu::copyAsync(amrex::Gpu::hostToDevice, pts.begin(), pts.end(),
+                          d_pts.begin());
+    const LMCurvedInitialData self = *this;
+    const amrex::Real *P = d_pts.data();
+    amrex::Real *O       = d_out.data();
+    amrex::ParallelFor(n,
+                       [=] AMREX_GPU_DEVICE(int k) noexcept
+                       {
+                           constexpr int iu[6] = {0, 0, 0, 1, 1, 2};
+                           constexpr int ju[6] = {0, 1, 2, 1, 2, 2};
+                           amrex::Real psi = 0.0, chi = 0.0;
+                           Tensor::Rank2 h, A;
+                           self.consumer_state(P[3 * k], P[3 * k + 1],
+                                               P[3 * k + 2], psi, chi, h, A);
+                           amrex::Real *o = O + 14 * k;
+                           o[0]           = psi;
+                           o[1]           = chi;
+                           for (int m = 0; m < 6; ++m)
+                           {
+                               o[2 + m] = h(iu[m], ju[m]);
+                               o[8 + m] = A(iu[m], ju[m]);
+                           }
+                       });
+    std::vector<amrex::Real> got(d_out.size());
+    amrex::Gpu::copyAsync(amrex::Gpu::deviceToHost, d_out.begin(), d_out.end(),
+                          got.begin());
+    amrex::Gpu::streamSynchronize();
+
+    double dpsi = 0.0, dchi = 0.0, dh = 0.0, dA = 0.0;
+    for (int k = 0; k < n; ++k)
+    {
+        const amrex::Real *g = got.data() + 14 * k;
+        const double *r      = ref.data() + 14 * k;
+        dpsi                 = std::max(dpsi, std::abs(g[0] - r[0]));
+        dchi                 = std::max(dchi, std::abs(g[1] - r[1]));
+        for (int m = 0; m < 6; ++m)
         {
-            ss >> v;
+            dh = std::max(dh, std::abs(g[2 + m] - r[2 + m]));
+            dA = std::max(dA, std::abs(g[8 + m] - r[8 + m]));
         }
-        amrex::Real psi_got = 0.0, chi_got = 0.0;
-        Tensor::Rank2 h_got, A_got;
-        consumer_state(x, y, z, psi_got, chi_got, h_got, A_got);
-        dpsi = std::max(dpsi, std::abs(psi_got - psi_ref));
-        dchi = std::max(dchi, std::abs(chi_got - chi_ref));
-        const int iu[6] = {0, 0, 0, 1, 1, 2};
-        const int ju[6] = {0, 1, 2, 1, 2, 2};
-        for (int k = 0; k < 6; ++k)
-        {
-            dh = std::max(dh, std::abs(h_got(iu[k], ju[k]) - h_ref[k]));
-            dA = std::max(dA, std::abs(A_got(iu[k], ju[k]) - A_ref[k]));
-        }
-        ++n;
     }
     amrex::Print() << "LMCurvedInitialData::validate: " << n
                    << " reference points, max|dpsi| = " << dpsi

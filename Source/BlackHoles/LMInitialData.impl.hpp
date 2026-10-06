@@ -14,10 +14,14 @@
 #include "TensorAlgebra.hpp"
 
 #include <AMReX.H>
+#include <AMReX_GpuContainers.H>
+#include <AMReX_GpuLaunch.H>
 
 #include <cmath>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
 
 // --------------------------------------------------------------------------
 // Barycentric interpolation
@@ -290,9 +294,12 @@ LMInitialData::validate(const std::string &reference_file) const
     {
         amrex::Abort("LMInitialData::validate: cannot open " + reference_file);
     }
-    double dpsi_max = 0.0;
-    double dA_max   = 0.0;
-    long n          = 0;
+    // Parse on the host, evaluate ON THE DEVICE: the coefficients live in
+    // amrex::Gpu::DeviceVector (LMSpectralData), so a host-side psi()/Ahat()
+    // dereferences device memory -- harmless on a CPU build, a segfault on a
+    // CUDA one (Hortense job 14416404).  See LMCurvedInitialData::validate.
+    std::vector<amrex::Real> pts;  // x y z per point
+    std::vector<double> ref;       // psi Ahat[6] per point (7)
     std::string line;
     while (std::getline(f, line))
     {
@@ -301,21 +308,55 @@ LMInitialData::validate(const std::string &reference_file) const
             continue;
         }
         std::istringstream ss(line);
-        double x = 0, y = 0, z = 0, psi_ref = 0;
-        double a[6] = {};
-        ss >> x >> y >> z >> psi_ref >> a[0] >> a[1] >> a[2] >> a[3] >> a[4] >>
-            a[5];
-        // The table is in puncture-centred coordinates, so evaluate directly.
-        dpsi_max = std::max(dpsi_max, std::abs(psi(x, y, z) - psi_ref));
-        Tensor::Rank2 A = Ahat(x, y, z);
-        const double ref[6] = {a[0], a[1], a[2], a[3], a[4], a[5]};
-        const double got[6] = {A(0, 0), A(0, 1), A(0, 2),
-                               A(1, 1), A(1, 2), A(2, 2)};
-        for (int k = 0; k < 6; ++k)
+        double v[10] = {};
+        for (double &x : v)
         {
-            dA_max = std::max(dA_max, std::abs(got[k] - ref[k]));
+            ss >> x;
         }
-        ++n;
+        pts.insert(pts.end(), v, v + 3);
+        ref.insert(ref.end(), v + 3, v + 10);
+    }
+    const int n = static_cast<int>(pts.size() / 3);
+
+    amrex::Gpu::DeviceVector<amrex::Real> d_pts(pts.size());
+    amrex::Gpu::DeviceVector<amrex::Real> d_out(static_cast<std::size_t>(7) * n);
+    amrex::Gpu::copyAsync(amrex::Gpu::hostToDevice, pts.begin(), pts.end(),
+                          d_pts.begin());
+    const LMInitialData self = *this;
+    const amrex::Real *P     = d_pts.data();
+    amrex::Real *O           = d_out.data();
+    // The table is in puncture-centred coordinates, so evaluate directly.
+    amrex::ParallelFor(n,
+                       [=] AMREX_GPU_DEVICE(int k) noexcept
+                       {
+                           const amrex::Real x = P[3 * k], y = P[3 * k + 1],
+                                             z = P[3 * k + 2];
+                           amrex::Real *o      = O + 7 * k;
+                           o[0]                = self.psi(x, y, z);
+                           Tensor::Rank2 A     = self.Ahat(x, y, z);
+                           o[1]                = A(0, 0);
+                           o[2]                = A(0, 1);
+                           o[3]                = A(0, 2);
+                           o[4]                = A(1, 1);
+                           o[5]                = A(1, 2);
+                           o[6]                = A(2, 2);
+                       });
+    std::vector<amrex::Real> got(d_out.size());
+    amrex::Gpu::copyAsync(amrex::Gpu::deviceToHost, d_out.begin(), d_out.end(),
+                          got.begin());
+    amrex::Gpu::streamSynchronize();
+
+    double dpsi_max = 0.0;
+    double dA_max   = 0.0;
+    for (int k = 0; k < n; ++k)
+    {
+        const amrex::Real *g = got.data() + 7 * k;
+        const double *r      = ref.data() + 7 * k;
+        dpsi_max             = std::max(dpsi_max, std::abs(g[0] - r[0]));
+        for (int m = 1; m < 7; ++m)
+        {
+            dA_max = std::max(dA_max, std::abs(g[m] - r[m]));
+        }
     }
     amrex::Print() << "LMInitialData::validate: " << n << " reference points, "
                    << "max|dpsi| = " << dpsi_max
