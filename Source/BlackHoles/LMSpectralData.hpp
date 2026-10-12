@@ -37,6 +37,15 @@
 // ships the smooth factor, so polynomial interpolation is exact.  The versions
 // are NOT interchangeable: reading a format-2 file with the format-1 rule is
 // silently wrong, which is why the check below is an equality, not a minimum.
+//
+// FORMAT 4 (the solver's "v2" grid).  Same token stream; the angular nodes are
+// the ABT angle s (key `s`, B = 2s/(1+s^2)), the A nodes are Chebyshev-Gauss
+// (no node at A=0 or A=1), and what is shipped is V_k = u_k/(A-1): the consumer
+// interpolates C,S in (A,s) and multiplies by (A-1) at the query point.  There
+// is NO axis factor: on the ABT angle u_k is analytic in s.  The file must also
+// declare `angular_map abt` and `radial_map gauss`.  Each format has its own
+// rule and the check stays an equality per format: 2 and 4 are read, anything
+// else (including the curved sibling's format 3) is refused.
 
 #ifndef LMSPECTRALDATA_HPP_
 #define LMSPECTRALDATA_HPP_
@@ -79,6 +88,7 @@ class LMSpectralData
             p.S_B[d] = m_S_B[d];
         }
         p.center        = a_center;
+        p.format        = m_format;
         p.nA            = m_nA;
         p.nB            = m_nB;
         p.nphi          = m_nphi;
@@ -111,9 +121,10 @@ class LMSpectralData
             amrex::Abort("LMSpectralData: cannot open " + filename);
         }
 
-        std::vector<double> A, B, C, S;
+        std::vector<double> A, B, s_nodes, C, S;
         std::vector<int> cos_m, sin_m;
         int format = -1, Na = -1, Nb = -1, ncos = -1, nsin = -1;
+        std::string angular_map, radial_map;
         std::string line;
         while (std::getline(f, line))
         {
@@ -132,6 +143,14 @@ class LMSpectralData
             if (key == "format")
             {
                 ss >> format;
+            }
+            else if (key == "angular_map")
+            {
+                ss >> angular_map;
+            }
+            else if (key == "radial_map")
+            {
+                ss >> radial_map;
             }
             else if (key == "b")
             {
@@ -197,10 +216,14 @@ class LMSpectralData
                     sin_m.push_back(v);
                 }
             }
-            else if (key == "A" || key == "B" || key == "C" || key == "S")
+            else if (key == "A" || key == "B" || key == "s" || key == "C" ||
+                     key == "S")
             {
-                std::vector<double> &dst =
-                    (key == "A") ? A : (key == "B") ? B : (key == "C") ? C : S;
+                std::vector<double> &dst = (key == "A")   ? A
+                                           : (key == "B") ? B
+                                           : (key == "s") ? s_nodes
+                                           : (key == "C") ? C
+                                                          : S;
                 double v = 0.0;
                 while (ss >> v)
                 {
@@ -209,14 +232,32 @@ class LMSpectralData
             }
         }
 
-        if (format != 2)
+        if (format != 2 && format != 4)
         {
             amrex::Abort("LMSpectralData: " + filename + " has format " +
                          std::to_string(format) +
-                         ", expected 2 (format 1 shipped the physical "
-                         "coefficients, not the smooth factor, and its data are "
-                         "not interchangeable with these — re-export)");
+                         ", expected 2 or 4 (format 1 shipped the physical "
+                         "coefficients, not the smooth factor; format 3 is the "
+                         "curved-puncture channel, LMCurvedSpectralData — none "
+                         "is interchangeable with these: re-export)");
         }
+        if (format == 4)
+        {
+            if (angular_map != "abt" || radial_map != "gauss")
+            {
+                amrex::Abort("LMSpectralData: " + filename +
+                             " is format 4 but does not declare 'angular_map "
+                             "abt' and 'radial_map gauss'");
+            }
+            if (!B.empty())
+            {
+                amrex::Abort("LMSpectralData: " + filename +
+                             " is format 4 but carries B nodes; its angular "
+                             "nodes are s");
+            }
+            B = s_nodes; // the angular node array is s in format 4
+        }
+        m_format = format;
         m_nA = Na + 1; // Na is the Chebyshev order: Na+1 nodes
         m_nB = Nb;
         if (m_nA <= 0 || m_nB <= 0 || m_nphi <= 0)
@@ -309,7 +350,7 @@ class LMSpectralData
 
     double m_b{}, m_m_A{}, m_m_B{};
     double m_P_A[3]{}, m_P_B[3]{}, m_S_A[3]{}, m_S_B[3]{};
-    int m_nA{-1}, m_nB{-1}, m_nphi{-1}, m_ncos{-1}, m_nsin{-1};
+    int m_format{-1}, m_nA{-1}, m_nB{-1}, m_nphi{-1}, m_ncos{-1}, m_nsin{-1};
     amrex::Gpu::DeviceVector<amrex::Real> m_A, m_B, m_wA, m_wB, m_C, m_S;
     amrex::Gpu::DeviceVector<int> m_cos_m, m_sin_m;
     std::vector<std::string> m_provenance;

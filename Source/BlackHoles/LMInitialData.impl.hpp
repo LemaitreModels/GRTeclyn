@@ -83,6 +83,71 @@ LMInitialData::u(amrex::Real x, amrex::Real y, amrex::Real z) const
     amrex::Real tA[LM_MAX_NODES];
     amrex::Real tB[LM_MAX_NODES];
     bary(Aq, m_params.A, m_params.wA, m_params.nA, tA);
+
+    if (m_params.format == 4)
+    {
+        // FORMAT 4 (the "v2" grid): the angular coordinate is the ABT angle s,
+        // B = 2s/(1+s^2), and u = (A-1) V with no axis factor (u_k is analytic
+        // in s).  s is ill-conditioned in B next to the outer axis
+        // (1-s ~ sqrt(2(1-B))), so 1-B and 1+B are formed from r -/+ c terms,
+        // rationalised as rho^2/(r +/- c) where they would cancel — the rule of
+        // export_grteclyn.inverse_abt_s, transcribed.
+        const amrex::Real c1   = z - b;
+        const amrex::Real c2   = z + b;
+        const amrex::Real rho2 = rho * rho;
+        // r - c, stable for c > 0;  r + c, stable for c < 0 (plain lambdas
+        // avoided: this body runs on the device)
+        const amrex::Real r1mc = (c1 > 0.0) ? rho2 / (r1 + c1) : r1 - c1;
+        const amrex::Real r2mc = (c2 > 0.0) ? rho2 / (r2 + c2) : r2 - c2;
+        const amrex::Real r1pc = (c1 < 0.0) ? rho2 / (r1 - c1) : r1 + c1;
+        const amrex::Real r2pc = (c2 < 0.0) ? rho2 / (r2 - c2) : r2 + c2;
+        const amrex::Real Ssum = r1 + r2;
+        amrex::Real B4         = 2.0 * z / Ssum;
+        B4                     = std::min(std::max(B4, -1.0), 1.0);
+        const amrex::Real om   = (r1mc + r2mc) / Ssum; // 1 - B
+        const amrex::Real op   = (r1pc + r2pc) / Ssum; // 1 + B
+        const amrex::Real sq =
+            B4 / (1.0 + std::sqrt(std::max(om * op, 0.0)));
+        bary(sq, m_params.B, m_params.wB, m_params.nB, tB);
+
+        const int nA4      = m_params.nA;
+        const int nB4      = m_params.nB;
+        amrex::Real out4   = 0.0;
+        for (int t = 0; t < m_params.ncos; ++t)
+        {
+            amrex::Real coef = 0.0;
+            for (int i = 0; i < nA4; ++i)
+            {
+                amrex::Real inner = 0.0;
+                for (int j = 0; j < nB4; ++j)
+                {
+                    inner +=
+                        tB[j] * m_params.C[(i * nB4 + j) * m_params.ncos + t];
+                }
+                coef += tA[i] * inner;
+            }
+            out4 += coef * std::cos(m_params.cos_m[t] * phi);
+        }
+        for (int t = 0; t < m_params.nsin; ++t)
+        {
+            amrex::Real coef = 0.0;
+            for (int i = 0; i < nA4; ++i)
+            {
+                amrex::Real inner = 0.0;
+                for (int j = 0; j < nB4; ++j)
+                {
+                    inner +=
+                        tB[j] * m_params.S[(i * nB4 + j) * m_params.nsin + t];
+                }
+                coef += tA[i] * inner;
+            }
+            out4 += coef * std::sin(m_params.sin_m[t] * phi);
+        }
+        // the radial factor, restored at the query point: u -> 0 at A = 1
+        // (spatial infinity) by construction
+        return (Aq - 1.0) * out4;
+    }
+
     bary(Bq, m_params.B, m_params.wB, m_params.nB, tB);
 
     // Interpolate the phi-modal coefficients in (A,B) — B inner, A outer, the

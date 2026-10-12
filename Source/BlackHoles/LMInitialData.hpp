@@ -63,8 +63,10 @@ class LMInitialData
         double S_A[3]{};
         double S_B[3]{};
         std::array<double, AMREX_SPACEDIM> center{};
+        int format{2}; //!< 2: (A,B) Lobatto A, polynomial in B, axis factor w(k,B);
+                       //!< 4: (A,s) Chebyshev-Gauss A, ABT angle s, u = (A-1) V
         int nA{};   //!< number of A nodes (= Na+1)
-        int nB{};   //!< number of B nodes
+        int nB{};   //!< number of angular nodes (B in format 2, s in format 4)
         int nphi{};
         int ncos{};
         int nsin{};
