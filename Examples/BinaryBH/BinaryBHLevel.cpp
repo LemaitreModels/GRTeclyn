@@ -562,6 +562,10 @@ void BinaryBHLevel::specific_post_init()
         BoostedBHInitialData::params_t bh1_params(1);
         BoostedBHInitialData::params_t bh2_params(2);
 #ifdef USE_TWOPUNCTURES
+        // The TwoPunctures solver state is static in TwoPuncturesInitialData
+        // and initData() has already solved it, so this instance (as in
+        // errorEst()) only reads the solved puncture centres: no new solve.
+        TwoPuncturesInitialData two_punctures_initial_data(Geom().CellSize(0));
         two_punctures_initial_data.set_bh_params(bh1_params, bh2_params);
 #else
         bh1_params.fill_params();
