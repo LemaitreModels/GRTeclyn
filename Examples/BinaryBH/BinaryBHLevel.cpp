@@ -18,6 +18,7 @@
 #include "LMCurvedSpectralData.hpp"
 #include "LMInitialData.hpp"
 #include "LMSpectralData.hpp"
+#include "LMHistoryGridData.hpp"
 #include "PositiveChiAndLapse.hpp"
 #include "PunctureTagger.hpp"
 #include "PunctureTracker.hpp"
@@ -80,6 +81,11 @@ void BinaryBHLevel::initData()
         amrex::Print() << "BinaryBHLevel::initData " << Level() << "\n";
     }
 #ifdef USE_TWOPUNCTURES
+    GRParmParse lm_history_pp("lm");
+    std::string history_id_file;
+    lm_history_pp.queryAdd("history_id_file", history_id_file);
+    if (!history_id_file.empty())
+        amrex::Abort("lm.history_id_file requires a build without USE_TWOPUNCTURES");
     TwoPuncturesInitialData two_punctures_initial_data(Geom().CellSize(0));
 
     two_punctures_initial_data.solve(); // only solves first time
@@ -130,8 +136,14 @@ void BinaryBHLevel::initData()
     GRParmParse lm_pp("lm");
     std::string lm_id_file;
     std::string lm_curved_id_file;
+    std::string lm_history_id_file;
     lm_pp.queryAdd("id_file", lm_id_file);
     lm_pp.queryAdd("curved_id_file", lm_curved_id_file);
+    lm_pp.queryAdd("history_id_file", lm_history_id_file);
+    if (static_cast<int>(!lm_id_file.empty()) +
+        static_cast<int>(!lm_curved_id_file.empty()) +
+        static_cast<int>(!lm_history_id_file.empty()) > 1)
+        amrex::Abort("LM id_file, curved_id_file and history_id_file are mutually exclusive");
 
     // Domain centre, hoisted: BOTH LM channels need it, and the flat branch
     // used to compute it inside its own scope.  BaseParameterChecker::
@@ -147,8 +159,26 @@ void BinaryBHLevel::initData()
     GRParmParse geom_pp("geometry");
     geom_pp.queryAdd("center", lm_center);
 
-    // Curved channel FIRST, and mutually exclusive with the flat one.
-    if (!lm_curved_id_file.empty())
+    if (!lm_history_id_file.empty())
+    {
+        // Full physical Cartesian gamma/K with explicit gauge (format 5).
+        // The data cover the finite evolution domain INCLUDING ghost cells;
+        // interpolation outside that domain aborts rather than extrapolating.
+        static const LMHistoryGridData history_data(lm_history_id_file);
+        LMHistoryInitialData history(history_data.view(), lm_center, dx);
+        static_assert(std::is_trivially_copyable_v<LMHistoryInitialData>);
+        amrex::ParallelFor(
+            state_new, state_new.nGrowVect(),
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            { history(ix, iy, iz, state_arrays[box_no]); });
+        amrex::Gpu::streamSynchronize();
+        GammaCalculator<> gamma_init(dx);
+        amrex::ParallelFor(
+            state_new,
+            [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz)
+            { gamma_init(ix, iy, iz, state_arrays[box_no]); });
+    }
+    else if (!lm_curved_id_file.empty())
     {
         // LM-initial-data CONFORMALLY CURVED spectral initial data (format 3,
         // spinning-at-rest sector).  Runtime-selected like the flat channel
